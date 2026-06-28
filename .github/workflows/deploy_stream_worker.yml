@@ -1,0 +1,91 @@
+name: Deploy Stream Worker (Lightning AI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream_url:
+        description: 'HLS/RTMP stream URL'
+        required: true
+      match_id:
+        description: 'Match identifier'
+        required: true
+      dry_run:
+        description: 'Paper trade mode (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 hours max
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Lightning CLI
+        run: pip install --upgrade lightning-cli lightning-sdk
+
+      - name: Provision Lightning AI Studio
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+        run: |
+          chmod +x infra/lightning_provision.sh
+          ./infra/lightning_provision.sh "soccer-trade-${{ github.run_id }}"
+
+      - name: Wait for Studio to be ready
+        run: sleep 60
+
+      - name: Deploy pipeline to Studio
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+        run: |
+          # Clone repo inside Studio
+          lightning run studio \
+            --name "soccer-trade-${{ github.run_id }}" \
+            --command "git clone https://github.com/${{ github.repository }}.git && cd soccer-trade-bot && pip install -r infra/requirements.txt"
+
+      - name: Run inference pipeline
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+          STREAM_URL: ${{ github.event.inputs.stream_url }}
+          MATCH_ID: ${{ github.event.inputs.match_id }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          POLYMARKET_PRIVATE_KEY: ${{ secrets.POLYMARKET_PRIVATE_KEY }}
+          KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          lightning run studio \
+            --name "soccer-trade-${{ github.run_id }}" \
+            --command "cd soccer-trade-bot && python -m main"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p logs
+          # Would collect logs from Lightning AI here
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: match-logs-${{ github.event.inputs.match_id }}
+          path: logs/
+          retention-days: 30
+
+      - name: Stop Lightning AI Studio
+        if: always()
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+        run: |
+          chmod +x infra/lightning_teardown.sh
+          ./infra/lightning_teardown.sh "soccer-trade-${{ github.run_id }}" || true

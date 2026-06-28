@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data
+data/*.parquet
+data/*.db
+data/frames/
+data/train/
+data/val/
+data/soccernet*/
+data/yolo_soccer/
+data/clip_soccer_data/
+
+# Model artifacts (large files - use Git LFS)
+model/*.pkl
+model/*.pt
+model/*.pth
+model/*.onnx
+runs/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+/tmp/
+*.tmp

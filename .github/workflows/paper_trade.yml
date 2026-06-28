@@ -1,0 +1,76 @@
+name: Paper Trade (DRY_RUN)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream_url:
+        description: 'HLS/RTMP stream URL'
+        required: true
+      match_id:
+        description: 'Match identifier'
+        required: true
+
+jobs:
+  paper-trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r infra/requirements.txt
+
+      - name: Verify DRY_RUN mode
+        run: |
+          echo "=== PAPER TRADING MODE ==="
+          echo "DRY_RUN will be set to 'true'"
+          echo "No real orders will be placed"
+          echo "All signals will be logged to SQLite"
+
+      - name: Run paper trading pipeline
+        env:
+          STREAM_URL: ${{ github.event.inputs.stream_url }}
+          MATCH_ID: ${{ github.event.inputs.match_id }}
+          DRY_RUN: "true"
+          DB_PATH: "data/paper_trades.db"
+        run: |
+          python -m main
+
+      - name: Export paper trade results
+        if: always()
+        run: |
+          mkdir -p data
+          # Export SQLite to CSV for analysis
+          python -c "
+          import sqlite3
+          import pandas as pd
+          conn = sqlite3.connect('data/paper_trades.db')
+          try:
+              signals = pd.read_sql('SELECT * FROM signals', conn)
+              signals.to_csv('data/paper_signals.csv', index=False)
+          except: pass
+          try:
+              trades = pd.read_sql('SELECT * FROM trades', conn)
+              trades.to_csv('data/paper_trades.csv', index=False)
+          except: pass
+          conn.close()
+          "
+
+      - name: Upload paper trade results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-trade-results-${{ github.event.inputs.match_id }}
+          path: |
+            data/paper_trades.db
+            data/paper_signals.csv
+            data/paper_trades.csv
+            data/bot.log
+          retention-days: 30

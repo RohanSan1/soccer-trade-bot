@@ -1,0 +1,131 @@
+name: Train Model (OVH H100)
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Training epochs for vision models'
+        required: false
+        default: '100'
+      grid_search:
+        description: 'Run GridSearchCV (slower but better)'
+        required: false
+        default: 'false'
+
+env:
+  OVH_INSTANCE_TYPE: h100-360
+  OVH_REGION: BHS5
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 600  # 10 hours max
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r infra/requirements.txt
+
+      - name: Provision OVH H100 instance
+        env:
+          OVH_APP_KEY: ${{ secrets.OVH_APP_KEY }}
+          OVH_APP_SECRET: ${{ secrets.OVH_APP_SECRET }}
+          OVH_CONSUMER_KEY: ${{ secrets.OVH_CONSUMER_KEY }}
+          OVH_PROJECT_ID: ${{ secrets.OVH_PROJECT_ID }}
+          OVH_REGION: ${{ env.OVH_REGION }}
+          OVH_FLAVOR: ${{ env.OVH_INSTANCE_TYPE }}
+        run: |
+          chmod +x infra/ovh_provision.sh
+          ./infra/ovh_provision.sh
+          # Read instance IP for SSH
+          INSTANCE_IP=$(jq -r '.ip_address' /tmp/ovh_instance_info.json)
+          echo "INSTANCE_IP=$INSTANCE_IP" >> $GITHUB_ENV
+
+      - name: Wait for instance to be ready
+        run: |
+          echo "Waiting 120s for instance initialization..."
+          sleep 120
+
+      - name: Deploy and run training via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ secrets.OVH_SSH_PRIVATE_KEY }}
+          script: |
+            # Clone repo
+            git clone https://github.com/${{ github.repository }}.git
+            cd soccer-trade-bot
+
+            # Install dependencies
+            pip install -r infra/requirements.txt
+
+            # Build dataset
+            python -m data.build_dataset --output data/train.parquet
+
+            # Train XGBoost + LightGBM ensemble
+            python -m model.train \
+              --data data/train.parquet \
+              --output model \
+              ${{ github.event.inputs.grid_search == 'true' && '--grid-search' || '' }}
+
+            # Train YOLOv10-X
+            python -m vision.train_yolo \
+              --epochs ${{ github.event.inputs.epochs || '100' }} \
+              --imgsz 1280 \
+              --batch 16
+
+            # Train CLIP ViT-L/14
+            python -m vision.train_clip \
+              --epochs 20 \
+              --batch-size 32
+
+      - name: Copy model artifacts from OVH
+        run: |
+          mkdir -p model
+          scp -o StrictHostKeyChecking=no \
+            -i ${{ secrets.OVH_SSH_PRIVATE_KEY }} \
+            ubuntu@${{ env.INSTANCE_IP }}:soccer-trade-bot/model/*.pkl \
+            ubuntu@${{ env.INSTANCE_IP }}:soccer-trade-bot/model/*.pt \
+            ubuntu@${{ env.INSTANCE_IP }}:soccer-trade-bot/model/*.json \
+            model/ 2>/dev/null || true
+
+      - name: Upload model artifacts to Lightning AI Drive
+        env:
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+        run: |
+          pip install lightning-sdk
+          # Upload model artifacts to Lightning Drive
+          for f in model/*; do
+            if [ -f "$f" ]; then
+              lightning upload "$f" --path "soccer-trade-bot/model/"
+            fi
+          done
+
+      - name: Terminate OVH instance
+        if: always()
+        env:
+          OVH_APP_KEY: ${{ secrets.OVH_APP_KEY }}
+          OVH_APP_SECRET: ${{ secrets.OVH_APP_SECRET }}
+          OVH_CONSUMER_KEY: ${{ secrets.OVH_CONSUMER_KEY }}
+          OVH_PROJECT_ID: ${{ secrets.OVH_PROJECT_ID }}
+        run: |
+          chmod +x infra/ovh_teardown.sh
+          ./infra/ovh_teardown.sh || true
+
+      - name: Upload model artifacts as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: model/
+          retention-days: 30
