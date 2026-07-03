@@ -164,7 +164,7 @@ class CLIPEncoder(nn.Module):
             features = self.clip.encode_image(images)
             features = features / features.norm(dim=-1, keepdim=True)
 
-        return self.classifier(features)
+        return self.classifier(features.float())
 
 
 def train_clip(
