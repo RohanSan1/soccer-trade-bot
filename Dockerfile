@@ -32,6 +32,6 @@ RUN pip install --no-cache-dir -r requirements-train.txt
 COPY . .
 
 RUN chmod +x infra/*.sh 2>/dev/null || true
-RUN mkdir -p data && chmod 777 data
+RUN mkdir -p data model && chmod 777 data model
 
-CMD ["sh", "-c", "python -c \"from data.build_dataset import build_dataset; build_dataset('data/train.parquet')\" && python -m model.train --data data/train.parquet"]
+CMD ["sh", "-c", "python -c \"from data.build_dataset import build_dataset; build_dataset('data/train.parquet')\" && python -m model.train --data data/train.parquet --output /tmp/model && ls -la /tmp/model/"]
