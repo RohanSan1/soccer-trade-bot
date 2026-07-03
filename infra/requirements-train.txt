@@ -1,0 +1,30 @@
+# Training-specific requirements (no PaddleOCR/PaddlePaddle)
+# Used in Docker image for OVH AI Training
+
+# === Core ===
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=12.0.0
+
+# === Vision (training) ===
+ultralytics>=8.1.0
+transformers>=4.35.0
+torch>=2.1.0
+torchvision>=0.16.0
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
+clip @ git+https://github.com/openai/CLIP.git
+
+# === ML ===
+xgboost>=2.0.0
+lightgbm>=4.1.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# === Data ===
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# === Utilities ===
+python-dotenv>=1.0.0
+tqdm>=4.65.0

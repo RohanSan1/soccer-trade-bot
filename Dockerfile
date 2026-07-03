@@ -1,7 +1,7 @@
 FROM python:3.11-slim-bookworm
 
 LABEL maintainer="rohan5commit"
-LABEL description="Soccer trade bot training environment (slim)"
+LABEL description="Soccer trade bot training environment"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -19,14 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install PyTorch CPU+CUDA runtime (smaller than devel)
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
+RUN pip install --no-cache-dir --upgrade pip
 
-# Install remaining requirements
-COPY infra/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install PyTorch with CUDA support
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
+# Install training dependencies
+COPY infra/requirements-train.txt .
+RUN pip install --no-cache-dir -r requirements-train.txt
+
+# Copy project
 COPY . .
 
 RUN chmod +x infra/*.sh 2>/dev/null || true
