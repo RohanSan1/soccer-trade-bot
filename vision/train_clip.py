@@ -2,6 +2,8 @@
 
 Fine-tunes CLIP for event classification on broadcast frames:
   goal, red_card, var, penalty, normal_play
+
+GPU CONSTRAINT: Only CUDA 0 and 1 allowed. CUDA 2 and 3 belong to another agent.
 """
 from __future__ import annotations
 
@@ -13,6 +15,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
+
+# ENFORCE GPU CONSTRAINT BEFORE TORCH IMPORT
+from infra.gpu_constraint import enforce_gpu_constraint, get_allowed_device
+enforce_gpu_constraint()
+
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -182,8 +189,8 @@ def train_clip(
     """
     import clip
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Training CLIP on %s", device)
+    device = get_allowed_device()
+    logger.info("Training CLIP on %s (GPU constraint: CUDA 0,1 only)", device)
 
     # Load CLIP
     clip_model, preprocess = clip.load(model_name, device=device)
@@ -290,6 +297,11 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+
+    # Verify GPU constraint
+    from infra.gpu_constraint import verify_device
+    device = torch.device(get_allowed_device())
+    verify_device(device)
 
     data_dir = prepare_soccernet_actions(args.data)
     train_clip(

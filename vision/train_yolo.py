@@ -2,6 +2,8 @@
 
 Fine-tunes YOLOv10-X (largest variant) for player detection on broadcast footage.
 Trained on SoccerNet Tracking (200 clips × 30s with bounding boxes).
+
+GPU CONSTRAINT: Only CUDA 0 and 1 allowed. CUDA 2 and 3 belong to another agent.
 """
 from __future__ import annotations
 
@@ -10,6 +12,10 @@ import logging
 import os
 import shutil
 from pathlib import Path
+
+# ENFORCE GPU CONSTRAINT BEFORE ANYTHING ELSE
+from infra.gpu_constraint import enforce_gpu_constraint, get_allowed_device
+enforce_gpu_constraint()
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +168,9 @@ def train(
     """
     from ultralytics import YOLO
 
+    device = get_allowed_device()  # cuda:0
+    logger.info("Training on device: %s", device)
+
     model = YOLO(model_name)
 
     results = model.train(
@@ -174,7 +183,7 @@ def train(
         patience=20,
         save=True,
         save_period=10,
-        device=0,  # GPU
+        device=device,
         workers=8,
         optimizer="auto",
         lr0=0.001,
@@ -225,6 +234,12 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+
+    # Verify GPU constraint before training
+    from infra.gpu_constraint import verify_device
+    import torch
+    device = torch.device(get_allowed_device())
+    verify_device(device)
 
     data_yaml = prepare_soccernet_tracking(args.data)
     train(
