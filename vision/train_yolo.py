@@ -70,8 +70,8 @@ def prepare_soccernet_tracking(data_dir: str = "data/soccernet_tracking") -> str
             _convert_soccernet_label(label_path, out_label)
 
     # Create data.yaml
-    yaml_content = f"""train: {output_path / "train" / "images"}
-val: {output_path / "val" / "images"}
+    yaml_content = f"""train: train/images
+val: val/images
 
 nc: 3
 names: ['player', 'referee', 'ball']
@@ -133,8 +133,8 @@ def _create_synthetic_dataset(output_path: Path) -> str:
                 "\n".join(labels)
             )
 
-    yaml_content = f"""train: {output_path / "train" / "images"}
-val: {output_path / "val" / "images"}
+    yaml_content = f"""train: train/images
+val: val/images
 
 nc: 3
 names: ['player', 'referee', 'ball']
