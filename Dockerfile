@@ -33,4 +33,4 @@ COPY . .
 
 RUN chmod +x infra/*.sh 2>/dev/null || true
 
-CMD ["python", "-m", "model.train"]
+CMD ["sh", "-c", "mkdir -p data && python -c \"from data.build_dataset import build_dataset; build_dataset('data/train.parquet')\" && python -m model.train --data data/train.parquet"]
