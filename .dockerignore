@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pkl
+*.pt
+*.parquet
+data/trades.db
+model/*.pkl
+model/*.pt
+model/*.json
+*.log
+/tmp

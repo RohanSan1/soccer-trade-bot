@@ -1,38 +1,34 @@
-# Soccer Trade Bot - Training Image
-# For OVH AI Training (H100 GPUs)
-# Build: docker build -t ghcr.io/rohan5commit/soccer-trade-bot:training .
-# Run: docker run --gpus all ghcr.io/rohan5commit/soccer-trade-bot:training
-
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
+FROM python:3.11-slim-bookworm
 
 LABEL maintainer="rohan5commit"
-LABEL description="Soccer trade bot training environment"
+LABEL description="Soccer trade bot training environment (slim)"
 
-# Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements first (better Docker layer caching)
-COPY infra/requirements.txt .
-
-# Install Python dependencies
+# Install PyTorch CPU+CUDA runtime (smaller than devel)
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
-# Copy the entire project
+# Install remaining requirements
+COPY infra/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# Make scripts executable
 RUN chmod +x infra/*.sh 2>/dev/null || true
 
-# Default command: run ensemble training
 CMD ["python", "-m", "model.train"]
