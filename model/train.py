@@ -138,6 +138,7 @@ def train_xgboost(
             "min_child_weight": 5,
         }
 
+    final_params["early_stopping_rounds"] = 50
     model = xgb.XGBClassifier(**final_params)
     model.fit(
         X_train, y_train,
@@ -369,7 +370,7 @@ def train(
     X_val, y_val = X[val_mask], y[val_mask]
 
     logger.info(
-        "Split: %d train, %d val (%d matches each)",
+        "Split: %d train, %d val (%d train matches, %d val matches)",
         len(X_train), len(X_val), len(train_matches), len(val_matches),
     )
 
