@@ -106,7 +106,7 @@ def train_xgboost(
             "min_child_weight": [3, 5, 10],
         }
 
-        model = xgb.XGBClassifier(**base_params, early_stopping_rounds=30)
+        model = xgb.XGBClassifier(**base_params)
 
         # Use GroupKFold to prevent match leakage
         gkf = GroupKFold(n_splits=5)
