@@ -36,32 +36,54 @@ def fetch_statsbomb() -> pd.DataFrame:
     try:
         from statsbombpy import sb
 
-        # Pull all available competitions
-        competitions = sb.competitions()
-        all_events = []
+        import signal
 
-        for _, comp in competitions.iterrows():
-            try:
-                matches = sb.matches(
-                    competition_id=comp["competition_id"],
-                    season_id=comp["season_id"],
-                )
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("StatsBomb fetch timed out after 300s")
 
-                for _, match in matches.iterrows():
-                    events = sb.events(match_id=match["match_id"])
-                    snapshots = _process_match_events(events, match)
-                    all_events.extend(snapshots)
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(300)
 
-            except Exception as e:
-                logger.debug("Skipping competition %s: %s", comp.get("competition_name"), e)
-                continue
+        try:
+            competitions = sb.competitions()
+            all_events = []
+            MAX_MATCHES = 500
 
-        df = pd.DataFrame(all_events)
-        logger.info("StatsBomb: %d snapshots from %d matches", len(df), df["match_id"].nunique())
-        return df
+            for _, comp in competitions.iterrows():
+                if len(all_events) >= MAX_MATCHES * 10:
+                    break
+                try:
+                    matches = sb.matches(
+                        competition_id=comp["competition_id"],
+                        season_id=comp["season_id"],
+                    )
+
+                    for _, match in matches.iterrows():
+                        if len(all_events) >= MAX_MATCHES * 10:
+                            break
+                        events = sb.events(match_id=match["match_id"])
+                        snapshots = _process_match_events(events, match)
+                        all_events.extend(snapshots)
+
+                except Exception as e:
+                    logger.debug("Skipping competition %s: %s", comp.get("competition_name"), e)
+                    continue
+
+            df = pd.DataFrame(all_events)
+            logger.info("StatsBomb: %d snapshots from %d matches", len(df), df["match_id"].nunique())
+            return df
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     except ImportError:
         logger.warning("statsbombpy not installed")
+        return pd.DataFrame()
+    except TimeoutError:
+        logger.warning("StatsBomb fetch timed out, falling back to synthetic data")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.warning("StatsBomb fetch failed: %s", e)
         return pd.DataFrame()
 
 
@@ -81,7 +103,8 @@ def fetch_understat(league: str = "EPL") -> pd.DataFrame:
 
         # Understat uses JavaScript-rendered data
         url = f"https://understat.com/league/{league}"
-        resp = requests.get(url, timeout=30)
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=60)
         soup = BeautifulSoup(resp.text, "lxml")
 
         # Extract JSON data from script tags

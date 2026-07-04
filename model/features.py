@@ -91,18 +91,15 @@ def state_to_array(state: GameState) -> np.ndarray:
 
 
 def batch_states_to_array(states: List[GameState]) -> np.ndarray:
-    """Convert multiple GameStates to numpy array (N, 38).
+    """Convert multiple GameStates to numpy array (N, 39).
 
     Args:
         states: List of game state snapshots.
 
     Returns:
-        numpy array of shape (N, 38).
+        numpy array of shape (N, 39).
     """
-    return np.array(
-        [state_to_vector(s) for s in states],
-        dtype=np.float32,
-    )
+    return np.vstack([state_to_array(s) for s in states])
 
 
 def compute_momentum(
