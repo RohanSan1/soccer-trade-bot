@@ -40,4 +40,4 @@ ENV ULTRALYTICS_CACHE_DIR=/tmp/ultralytics
 ENV CLIP_HOME=/tmp/clip_cache
 ENV PYTHONPATH=/app
 
-CMD ["sh", "-c", "python -c \"from data.build_dataset import build_dataset; build_dataset('data/train.parquet')\" && python -m model.train --data data/train.parquet --output /tmp/model && ls -la /tmp/model/"]
+CMD ["sh", "-c", "echo '=== Building dataset ===' && python -c \"from data.build_dataset import build_dataset; build_dataset('data/train.parquet')\" && echo '=== Training with Optuna + CatBoost ===' && python -m model.train --data data/train.parquet --output /workspace/output/model --optuna --optuna-trials 200 && echo '=== Done ===' && ls -la /workspace/output/model/"]

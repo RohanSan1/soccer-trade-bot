@@ -46,16 +46,16 @@ def _run_with_timeout(func, timeout_sec, *args, **kwargs):
     return result[0], timed_out[0]
 
 
-def fetch_statsbomb_github(max_matches: int = 500) -> pd.DataFrame:
+def fetch_statsbomb_github(max_matches: int = 10000) -> pd.DataFrame:
     """Fetch StatsBomb open data via GitHub raw content API.
 
     Strategy:
     1. Shallow-clone only competitions.json + matches/ (tiny files)
     2. Parse to find match IDs for major leagues
-    3. Download event files via raw.githubusercontent.com (parallel)
+    3. Download event files via raw.githubusercontent.com (parallel with retry)
 
     Args:
-        max_matches: Maximum number of matches to process.
+        max_matches: Maximum number of matches to process (default: 10000 = all).
 
     Returns:
         DataFrame with match snapshots at 5-minute intervals.
@@ -115,42 +115,51 @@ def fetch_statsbomb_github(max_matches: int = 500) -> pd.DataFrame:
                     "match_id": m["match_id"],
                     "comp_id": comp_id,
                     "comp_name": comp.get("competition_name", ""),
+                    "comp_stage": m.get("match_stage", ""),
+                    "season_id": season_id,
                 })
         except Exception:
             continue
 
-    # Sort: priority leagues first
-    all_match_ids.sort(key=lambda x: (x["comp_id"] not in PRIORITY_COMP_IDS,))
+    # Sort: priority leagues first, then by match_id for consistency
+    all_match_ids.sort(key=lambda x: (x["comp_id"] not in PRIORITY_COMP_IDS, x["match_id"]))
     selected = all_match_ids[:max_matches]
-    logger.info("StatsBomb: %d total matches, selected %d from priority leagues",
+    logger.info("StatsBomb: %d total matches, selected %d (priority leagues first)",
                len(all_match_ids), len(selected))
 
-    # Step 3: Download event files via raw GitHub URL (parallel)
+    # Step 3: Download event files via raw GitHub URL (parallel with retry)
     existing = {fn.replace(".json", "") for fn in os.listdir(events_dir) if fn.endswith(".json")}
     to_fetch = [m for m in selected if str(m["match_id"]) not in existing]
     logger.info("StatsBomb: %d events to fetch, %d already cached", len(to_fetch), len(existing))
 
-    def _fetch_event(mid):
+    def _fetch_event(mid, retries=3):
         url = f"https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{mid}.json"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
-            with open(events_dir / f"{mid}.json", "wb") as f:
-                f.write(data)
-            return True
-        except Exception:
-            return False
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                with open(events_dir / f"{mid}.json", "wb") as f:
+                    f.write(data)
+                return True
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(1 * (attempt + 1))  # backoff: 1s, 2s
+        return False
 
     if to_fetch:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=20) as executor:
             futures = {executor.submit(_fetch_event, m["match_id"]): m for m in to_fetch}
             done = 0
+            failed = 0
             for future in as_completed(futures):
                 done += 1
-                if done % 100 == 0:
-                    logger.info("StatsBomb: fetched %d/%d events", done, len(to_fetch))
+                if not future.result():
+                    failed += 1
+                if done % 200 == 0:
+                    logger.info("StatsBomb: fetched %d/%d (%d failed)", done, len(to_fetch), failed)
+            logger.info("StatsBomb: fetch complete — %d/%d succeeded, %d failed",
+                       done - failed, len(to_fetch), failed)
 
     # Step 4: Parse events into snapshots
     return _parse_downloaded_events(selected, events_dir)
@@ -159,8 +168,12 @@ def fetch_statsbomb_github(max_matches: int = 500) -> pd.DataFrame:
 def _parse_downloaded_events(selected_matches: list, events_dir: Path) -> pd.DataFrame:
     """Parse downloaded StatsBomb event files into training snapshots."""
     match_lookup = {str(m["match_id"]): m for m in selected_matches}
-    all_snapshots = []
 
+    # Precompute team statistics from all matches for ELO, form, H2H
+    team_stats = _compute_team_stats(selected_matches, events_dir)
+
+    all_snapshots = []
+    parsed = 0
     for fn in os.listdir(events_dir):
         if not fn.endswith(".json"):
             continue
@@ -174,20 +187,176 @@ def _parse_downloaded_events(selected_matches: list, events_dir: Path) -> pd.Dat
         except Exception:
             continue
 
-        snapshots = _build_snapshots_from_sb_events(events, match_lookup[mid], "")
+        snapshots = _build_snapshots_from_sb_events(events, match_lookup[mid], "", team_stats)
         all_snapshots.extend(snapshots)
+        parsed += 1
+        if parsed % 500 == 0:
+            logger.info("StatsBomb: parsed %d matches, %d snapshots so far", parsed, len(all_snapshots))
 
     df = pd.DataFrame(all_snapshots) if all_snapshots else pd.DataFrame()
     logger.info("StatsBomb GitHub: %d snapshots from %d matches",
-               len(df), len(set(s["match_id"] for s in all_snapshots)))
+               len(df), len(set(s["match_id"] for s in all_snapshots)) if all_snapshots else 0)
     return df
+
+
+def _compute_team_stats(selected_matches: list, events_dir: Path) -> Dict:
+    """Precompute team statistics (ELO-like ratings, form, H2H) from all matches.
+
+    Returns dict with:
+        - team_elo: {team_id: elo_rating}
+        - team_form: {team_id: [last 5 match results]}
+        - team_wins/draws/losses: {team_id: count}
+        - h2h: {(home_id, away_id): [results]}
+        - team_last_match: {team_id: last_match_minute_sum}
+    """
+    team_elo: Dict[int, float] = {}
+    team_form: Dict[int, List[float]] = {}
+    team_wins: Dict[int, int] = {}
+    team_draws: Dict[int, int] = {}
+    team_losses: Dict[int, int] = {}
+    h2h: Dict[Tuple[int, int], List[float]] = {}
+    team_match_count: Dict[int, int] = {}
+
+    # Process matches in chronological order (by match_id)
+    sorted_matches = sorted(selected_matches, key=lambda x: x["match_id"])
+
+    for match in sorted_matches:
+        mid = str(match["match_id"])
+        events_path = events_dir / f"{mid}.json"
+        if not events_path.exists():
+            continue
+
+        try:
+            with open(events_path) as f:
+                events = json.load(f)
+        except Exception:
+            continue
+
+        # Find team IDs from Starting XI
+        home_team_id = None
+        away_team_id = None
+        for e in events:
+            if e.get("type", {}).get("name") == "Starting XI":
+                team = e.get("team", {})
+                tid = team.get("id") if isinstance(team, dict) else None
+                if home_team_id is None:
+                    home_team_id = tid
+                elif away_team_id is None and tid != home_team_id:
+                    away_team_id = tid
+                    break
+
+        if home_team_id is None or away_team_id is None:
+            continue
+
+        # Count goals
+        home_goals = 0
+        away_goals = 0
+        for e in events:
+            if e.get("type", {}).get("name") == "Shot":
+                shot = e.get("shot", {})
+                outcome = shot.get("outcome", {})
+                outcome_name = outcome.get("name", "") if isinstance(outcome, dict) else str(outcome)
+                if outcome_name == "Goal":
+                    team_id = e.get("team", {}).get("id") if isinstance(e.get("team"), dict) else None
+                    if team_id == home_team_id:
+                        home_goals += 1
+                    elif team_id == away_team_id:
+                        away_goals += 1
+
+        # Update ELO (simplified ELO update formula)
+        K = 32
+        for tid in [home_team_id, away_team_id]:
+            if tid not in team_elo:
+                team_elo[tid] = 1500.0
+            team_match_count[tid] = team_match_count.get(tid, 0) + 1
+
+        elo_home = team_elo[home_team_id]
+        elo_away = team_elo[away_team_id]
+        expected_home = 1.0 / (1.0 + 10 ** ((elo_away - elo_home) / 400))
+        expected_away = 1.0 - expected_home
+
+        if home_goals > away_goals:
+            actual_home, actual_away = 1.0, 0.0
+        elif home_goals < away_goals:
+            actual_home, actual_away = 0.0, 1.0
+        else:
+            actual_home, actual_away = 0.5, 0.5
+
+        team_elo[home_team_id] += K * (actual_home - expected_home)
+        team_elo[away_team_id] += K * (actual_away - expected_away)
+
+        # Update form (last 5 match results: 1=win, 0.5=draw, 0=loss)
+        for tid, is_home_team in [(home_team_id, True), (away_team_id, False)]:
+            if tid not in team_form:
+                team_form[tid] = []
+            if is_home_team:
+                result = 1.0 if home_goals > away_goals else (0.5 if home_goals == away_goals else 0.0)
+            else:
+                result = 1.0 if away_goals > home_goals else (0.5 if away_goals == home_goals else 0.0)
+            team_form[tid].append(result)
+            team_form[tid] = team_form[tid][-5:]  # keep last 5
+
+            # Update win/draw/loss counts
+            if result == 1.0:
+                team_wins[tid] = team_wins.get(tid, 0) + 1
+            elif result == 0.5:
+                team_draws[tid] = team_draws.get(tid, 0) + 1
+            else:
+                team_losses[tid] = team_losses.get(tid, 0) + 1
+
+        # Update H2H
+        h2h_key = (home_team_id, away_team_id)
+        if h2h_key not in h2h:
+            h2h[h2h_key] = []
+        h2h[h2h_key].append(1.0 if home_goals > away_goals else (0.5 if home_goals == away_goals else 0.0))
+
+    logger.info("Team stats computed: %d teams, %d matches processed",
+               len(team_elo), len(sorted_matches))
+
+    return {
+        "team_elo": team_elo,
+        "team_form": team_form,
+        "team_wins": team_wins,
+        "team_draws": team_draws,
+        "team_losses": team_losses,
+        "h2h": h2h,
+        "team_match_count": team_match_count,
+    }
 
 
 def _build_snapshots_from_sb_events(
     events: List[Dict], match: Dict, comp_name: str,
+    team_stats: Optional[Dict] = None,
 ) -> List[Dict]:
     """Build 5-minute interval snapshots from StatsBomb events JSON."""
     match_id = str(match.get("match_id", ""))
+    comp_id = match.get("comp_id", -1)
+    comp_stage = match.get("comp_stage", "")
+
+    # Competition tier mapping
+    COMP_TIER = {
+        37: 1,  # UEFA Champions League
+        11: 2,  # Premier League
+        12: 2,  # La Liga
+        20: 2,  # Bundesliga
+        16: 2,  # Serie A
+        9: 2,   # Ligue 1
+        43: 2,  # FA Cup
+        44: 2,  # Copa del Rey
+        1: 3,   # Other
+    }
+    comp_tier = COMP_TIER.get(comp_id, 3)
+
+    # Match importance from stage
+    match_importance = 0.5
+    if comp_stage:
+        stage_lower = comp_stage.lower()
+        if any(w in stage_lower for w in ["final", "semi", "quarter"]):
+            match_importance = 0.9
+        elif "round" in stage_lower:
+            match_importance = 0.7
+        elif "group" in stage_lower:
+            match_importance = 0.4
 
     # Derive home/away team IDs from Starting XI events
     home_team_id = None
@@ -201,6 +370,30 @@ def _build_snapshots_from_sb_events(
             else:
                 away_team_id = tid
                 break
+
+    # Get team stats from precomputed data
+    ts = team_stats or {}
+    team_elo = ts.get("team_elo", {})
+    team_form = ts.get("team_form", {})
+    h2h_data = ts.get("h2h", {})
+
+    home_elo = team_elo.get(home_team_id, 1500.0) if home_team_id else 1500.0
+    away_elo = team_elo.get(away_team_id, 1500.0) if away_team_id else 1500.0
+    elo_diff = home_elo - away_elo
+
+    home_form = sum(team_form.get(home_team_id, [])) if home_team_id else 0.0
+    away_form = sum(team_form.get(away_team_id, [])) if away_team_id else 0.0
+
+    # H2H: home team win rate from historical matchups
+    h2h_key = (home_team_id, away_team_id) if home_team_id and away_team_id else None
+    h2h_results = h2h_data.get(h2h_key, []) if h2h_key else []
+    h2h_home_winrate = (sum(1 for r in h2h_results if r == 1.0) / len(h2h_results)) if h2h_results else 0.4
+
+    # Squad value proxy: higher ELO = higher squad value
+    # Map ELO to approximate squad value (EUR)
+    home_value = max(1e8, 5e8 * (home_elo / 1500))
+    away_value = max(1e8, 5e8 * (away_elo / 1500))
+    squad_value_ratio = home_value / max(away_value, 1)
 
     # Count final score from events
     home_score_final = 0
@@ -294,6 +487,18 @@ def _build_snapshots_from_sb_events(
         a_xg_recent = sum(x for m, x in away_xg if clock - 15 < m <= clock)
         momentum = h_xg_recent - a_xg_recent
 
+        # Pressure: derived from score state and time remaining
+        time_remaining = max(90 - clock, 0)
+        if score_diff > 0:
+            pressure = min(0.8, 0.5 + score_diff * 0.1)
+        elif score_diff < 0:
+            pressure = max(0.2, 0.5 + score_diff * 0.1)
+        else:
+            pressure = 0.5
+        # Late-game trailing team presses more
+        if score_diff < 0 and clock > 75:
+            pressure = max(0.15, pressure - 0.2)
+
         snapshots.append({
             "match_id": match_id,
             "source": "statsbomb",
@@ -302,34 +507,34 @@ def _build_snapshots_from_sb_events(
             "is_extra_time": float(clock > 90),
             "home_red_cards": float(h_cards),
             "away_red_cards": float(a_cards),
-            "home_pressure_score": 0.5,
+            "home_pressure_score": float(pressure),
             "goals_in_last_10min": float(goals_last10),
             "home_shots_on_target": float(h_sot),
             "away_shots_on_target": float(a_sot),
             "home_xg_running": float(h_xg),
             "away_xg_running": float(a_xg),
-            "score_diff_x_time_remaining": float(score_diff * max(90 - clock, 0)),
-            "home_elo": 1500.0,
-            "away_elo": 1500.0,
-            "elo_diff": 0.0,
-            "home_form_pts": 0.0,
-            "away_form_pts": 0.0,
-            "h2h_home_winrate": 0.4,
+            "score_diff_x_time_remaining": float(score_diff * time_remaining),
+            "home_elo": float(home_elo),
+            "away_elo": float(away_elo),
+            "elo_diff": float(elo_diff),
+            "home_form_pts": float(home_form),
+            "away_form_pts": float(away_form),
+            "h2h_home_winrate": float(h2h_home_winrate),
             "is_home_game": 1.0,
             "referee_cards_per_game": 3.5,
-            "home_squad_value_EUR": 5e8,
-            "away_squad_value_EUR": 5e8,
-            "squad_value_ratio": 1.0,
+            "home_squad_value_EUR": float(home_value),
+            "away_squad_value_EUR": float(away_value),
+            "squad_value_ratio": float(squad_value_ratio),
             "home_injuries_count": 0.0,
             "away_injuries_count": 0.0,
-            "home_press_pct": 0.5,
-            "away_press_pct": 0.5,
+            "home_press_pct": float(pressure),
+            "away_press_pct": float(1.0 - pressure),
             "home_xg_last5": float(h_xg),
             "away_xg_last5": float(a_xg),
             "home_xga_last5": float(a_xg),
             "away_xga_last5": float(h_xg),
-            "competition_tier": 2.0,
-            "match_importance": 0.5,
+            "competition_tier": float(comp_tier),
+            "match_importance": float(match_importance),
             "days_since_last_match_home": 7.0,
             "days_since_last_match_away": 7.0,
             "goals_last_15min": float(goals_last10),
@@ -584,8 +789,8 @@ def build_dataset(output_path: str = "data/train.parquet") -> pd.DataFrame:
     start = time.time()
     all_dfs = []
 
-    # 1. StatsBomb (from GitHub — no API needed)
-    statsbomb_df = fetch_statsbomb_github(max_matches=500)
+    # 1. StatsBomb (from GitHub — fetch ALL matches)
+    statsbomb_df = fetch_statsbomb_github(max_matches=10000)
     if len(statsbomb_df) > 0:
         all_dfs.append(statsbomb_df)
 
@@ -620,14 +825,23 @@ def build_dataset(output_path: str = "data/train.parquet") -> pd.DataFrame:
     if "target" not in combined.columns:
         combined["target"] = 1
 
-    # Save
+    # Save to primary path
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
 
+    # Checkpoint to Object Storage if available
+    checkpoint_dir = Path("/workspace/output/data")
+    if checkpoint_dir.parent.exists():
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / "train_enriched.parquet"
+        combined.to_parquet(str(checkpoint_path), index=False)
+        logger.info("Checkpoint saved to %s", checkpoint_path)
+
     elapsed = time.time() - start
+    n_matches = len(combined["match_id"].unique()) if "match_id" in combined.columns else 0
     logger.info(
-        "Dataset built: %d rows, %d features, saved to %s (%.1f min)",
-        len(combined), len(FEATURE_NAMES), output_path, elapsed / 60,
+        "Dataset built: %d rows, %d matches, %d features, saved to %s (%.1f min)",
+        len(combined), n_matches, len(FEATURE_NAMES), output_path, elapsed / 60,
     )
 
     return combined
