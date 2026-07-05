@@ -108,10 +108,12 @@ def train_xgboost(
 
         # Use GroupKFold to prevent match leakage
         gkf = GroupKFold(n_splits=5)
-        # For grid search, we'll use a simple split instead of full CV
-        # to save time on H100
-        split_idx = int(len(X_train) * 0.8)
-        X_gs, y_gs = X_train[:split_idx], y_train[:split_idx]
+        # For grid search, shuffle to avoid class imbalance in splits
+        shuffle_idx = np.random.permutation(len(X_train))
+        X_shuffled = X_train[shuffle_idx]
+        y_shuffled = y_train[shuffle_idx]
+        split_idx = int(len(X_shuffled) * 0.8)
+        X_gs, y_gs = X_shuffled[:split_idx], y_shuffled[:split_idx]
 
         # Sample subset for faster grid search
         sample_size = min(50000, len(X_gs))
@@ -147,8 +149,10 @@ def train_xgboost(
 
     final_params["early_stopping_rounds"] = 50
     model = xgb.XGBClassifier(**final_params)
+    # Shuffle training data to avoid class ordering issues
+    fit_idx = np.random.permutation(len(X_train))
     model.fit(
-        X_train, y_train,
+        X_train[fit_idx], y_train[fit_idx],
         eval_set=[(X_val, y_val)],
         verbose=50,
     )
