@@ -43,12 +43,10 @@ def load_training_data(
     """
     parquet_path_str = str(parquet_path)
     if not Path(parquet_path_str).exists():
-        logger.warning("Parquet not found at %s — generating synthetic data", parquet_path_str)
-        from data.build_dataset import generate_synthetic_data
-        df = generate_synthetic_data()
-        Path(parquet_path_str).parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(parquet_path_str, index=False)
-        logger.info("Synthetic data saved to %s (%d rows)", parquet_path_str, len(df))
+        logger.info("Parquet not found at %s — building dataset from real sources", parquet_path_str)
+        from data.build_dataset import build_dataset
+        df = build_dataset(output_path=parquet_path_str)
+        logger.info("Dataset saved to %s (%d rows)", parquet_path_str, len(df))
     else:
         df = pd.read_parquet(parquet_path_str)
 

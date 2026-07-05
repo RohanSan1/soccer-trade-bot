@@ -1,19 +1,17 @@
 """Build training dataset from multiple sources.
 
 Pulls from 8 data sources to create ~2.1M game-state snapshots:
-- StatsBomb Open Data (~50K snapshots)
+- StatsBomb Open Data via GitHub (~50K snapshots)
 - Understat (2010-2026, 6 leagues) (~550K snapshots)
-- SoccerNet Events (~27K snapshots)
-- WyScout public dataset (~107K snapshots)
 - European Soccer Database (Kaggle) (~1.37M snapshots)
-- FBref via soccerdata (feature enrichment)
-- Transfermarkt via soccerdata (squad values, injuries)
-- Club Elo full history (pre-match ELO)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,66 +23,280 @@ from model.features import FEATURE_NAMES
 
 logger = logging.getLogger(__name__)
 
+# Timeout helper (replaces signal.SIGALRM for Docker compatibility)
+def _run_with_timeout(func, timeout_sec, *args, **kwargs):
+    """Run func with a timeout. Returns (result, timed_out)."""
+    result = [None]
+    timed_out = [False]
 
-def fetch_statsbomb() -> pd.DataFrame:
-    """Fetch historical match data from StatsBomb Open Data.
+    def _target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except Exception as e:
+            result[0] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        timed_out[0] = True
+    return result[0], timed_out[0]
+
+
+def fetch_statsbomb_github(max_matches: int = 500) -> pd.DataFrame:
+    """Fetch StatsBomb open data by cloning the GitHub repo (sparse).
+
+    This is faster and more reliable than the statsbombpy API.
+
+    Args:
+        max_matches: Maximum number of matches to process.
 
     Returns:
-        DataFrame with match snapshots.
+        DataFrame with match snapshots at 5-minute intervals.
     """
-    logger.info("Fetching StatsBomb data...")
-    try:
-        from statsbombpy import sb
+    logger.info("Fetching StatsBomb data from GitHub (sparse clone)...")
 
-        import signal
+    clone_dir = Path("/tmp/statsbomb_open_data")
 
-        def _timeout_handler(signum, frame):
-            raise TimeoutError("StatsBomb fetch timed out after 300s")
+    def _do_clone():
+        if (clone_dir / ".git").exists():
+            logger.info("StatsBomb repo already cloned, pulling latest")
+            subprocess.run(
+                ["git", "-C", str(clone_dir), "pull", "--ff-only"],
+                capture_output=True, timeout=60,
+            )
+            return
+        if clone_dir.exists():
+            import shutil
+            shutil.rmtree(clone_dir)
+        subprocess.run(
+            ["git", "clone", "--filter=blob:none", "--sparse",
+             "https://github.com/statsbomb/open-data.git", str(clone_dir)],
+            capture_output=True, timeout=300,
+        )
+        subprocess.run(
+            ["git", "-C", str(clone_dir), "sparse-checkout", "set",
+             "data/competitions.json", "data/matches", "data/events"],
+            capture_output=True, timeout=60,
+        )
 
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(300)
+    _, timed_out = _run_with_timeout(_do_clone, 360)
+    if timed_out:
+        logger.warning("StatsBomb GitHub clone timed out")
+        return pd.DataFrame()
+
+    if not (clone_dir / "data" / "competitions.json").exists():
+        logger.warning("StatsBomb data not found after clone")
+        return pd.DataFrame()
+
+    return _parse_statsbomb_github(clone_dir, max_matches)
+
+
+def _parse_statsbomb_github(clone_dir: Path, max_matches: int) -> pd.DataFrame:
+    """Parse StatsBomb GitHub data into training snapshots."""
+    data_dir = clone_dir / "data"
+
+    with open(data_dir / "competitions.json") as f:
+        competitions = json.load(f)
+
+    # Focus on major men's leagues for speed
+    PRIORITY_LEAGUES = {
+        "Premier League", "La Liga", "Bundesliga",
+        "Serie A", "Ligue 1", "Champions League",
+        "FIFA World Cup", "Copa America",
+    }
+
+    # Sort: priority leagues first
+    competitions.sort(
+        key=lambda c: (c.get("competition_name", "") not in PRIORITY_LEAGUES,
+                       -c.get("season_id", 0))
+    )
+
+    all_snapshots = []
+    matches_processed = 0
+
+    for comp in competitions:
+        if matches_processed >= max_matches:
+            break
+
+        comp_id = comp["competition_id"]
+        season_id = comp["season_id"]
+        comp_name = comp.get("competition_name", "Unknown")
+
+        matches_path = data_dir / "matches" / str(comp_id) / f"{season_id}.json"
+        if not matches_path.exists():
+            continue
 
         try:
-            competitions = sb.competitions()
-            all_events = []
-            MAX_MATCHES = 500
+            with open(matches_path) as f:
+                matches = json.load(f)
+        except Exception:
+            continue
 
-            for _, comp in competitions.iterrows():
-                if len(all_events) >= MAX_MATCHES * 10:
-                    break
-                try:
-                    matches = sb.matches(
-                        competition_id=comp["competition_id"],
-                        season_id=comp["season_id"],
-                    )
+        for match in matches:
+            if matches_processed >= max_matches:
+                break
 
-                    for _, match in matches.iterrows():
-                        if len(all_events) >= MAX_MATCHES * 10:
-                            break
-                        events = sb.events(match_id=match["match_id"])
-                        snapshots = _process_match_events(events, match)
-                        all_events.extend(snapshots)
+            match_id = match["match_id"]
+            events_path = data_dir / "events" / f"{match_id}.json"
+            if not events_path.exists():
+                continue
 
-                except Exception as e:
-                    logger.debug("Skipping competition %s: %s", comp.get("competition_name"), e)
-                    continue
+            try:
+                with open(events_path) as f:
+                    events = json.load(f)
+            except Exception:
+                continue
 
-            df = pd.DataFrame(all_events)
-            logger.info("StatsBomb: %d snapshots from %d matches", len(df), df["match_id"].nunique())
-            return df
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
+            snapshots = _build_snapshots_from_sb_events(events, match, comp_name)
+            all_snapshots.extend(snapshots)
+            matches_processed += 1
 
-    except ImportError:
-        logger.warning("statsbombpy not installed")
-        return pd.DataFrame()
-    except TimeoutError:
-        logger.warning("StatsBomb fetch timed out, falling back to synthetic data")
-        return pd.DataFrame()
-    except Exception as e:
-        logger.warning("StatsBomb fetch failed: %s", e)
-        return pd.DataFrame()
+            if matches_processed % 50 == 0:
+                logger.info("StatsBomb: processed %d/%d matches, %d snapshots",
+                           matches_processed, max_matches, len(all_snapshots))
+
+    df = pd.DataFrame(all_snapshots) if all_snapshots else pd.DataFrame()
+    logger.info("StatsBomb GitHub: %d snapshots from %d matches",
+               len(df), matches_processed)
+    return df
+
+
+def _build_snapshots_from_sb_events(
+    events: List[Dict], match: Dict, comp_name: str,
+) -> List[Dict]:
+    """Build 5-minute interval snapshots from StatsBomb events JSON."""
+    match_id = str(match["match_id"])
+
+    home_team_id = match.get("home_team", {}).get("home_team_id")
+    away_team_id = match.get("away_team", {}).get("away_team_id")
+
+    # Determine final result
+    home_score_final = match.get("home_score", 0) or 0
+    away_score_final = match.get("away_score", 0) or 0
+    if home_score_final > away_score_final:
+        target = 0  # home win
+    elif home_score_final == away_score_final:
+        target = 1  # draw
+    else:
+        target = 2  # away win
+
+    # Process events chronologically
+    home_goals = []
+    away_goals = []
+    home_shots_ot = []
+    away_shots_ot = []
+    home_xg = []
+    away_xg = []
+    home_cards = []
+    away_cards = []
+
+    for event in events:
+        minute = event.get("minute", 0)
+        team_id = event.get("team", {}).get("id") if isinstance(event.get("team"), dict) else event.get("team_id")
+        is_home = team_id == home_team_id
+
+        event_type = event.get("type", {})
+        type_name = event_type.get("name", "") if isinstance(event_type, dict) else str(event_type)
+
+        if type_name == "Shot":
+            shot = event.get("shot", {})
+            outcome = shot.get("outcome", {})
+            outcome_name = outcome.get("name", "") if isinstance(outcome, dict) else str(outcome)
+            xg = shot.get("statsbomb_xg", 0) or 0
+
+            if is_home:
+                home_xg.append((minute, xg))
+                if outcome_name in ("Goal", "Saved", "Post", "Woodwork"):
+                    home_shots_ot.append(minute)
+                if outcome_name == "Goal":
+                    home_goals.append(minute)
+            else:
+                away_xg.append((minute, xg))
+                if outcome_name in ("Goal", "Saved", "Post", "Woodwork"):
+                    away_shots_ot.append(minute)
+                if outcome_name == "Goal":
+                    away_goals.append(minute)
+
+        elif type_name == "Foul Committed":
+            card = event.get("foul_committed", {}).get("card", {})
+            card_name = card.get("name", "") if isinstance(card, dict) else ""
+            if card_name in ("Yellow Card", "Red Card", "Second Yellow"):
+                if is_home:
+                    home_cards.append(minute)
+                else:
+                    away_cards.append(minute)
+
+    # Build snapshots at 5-minute intervals
+    snapshots = []
+    for clock in range(0, 95, 5):
+        h_goals = sum(1 for m in home_goals if m <= clock)
+        a_goals = sum(1 for m in away_goals if m <= clock)
+        score_diff = h_goals - a_goals
+
+        h_sot = sum(1 for m in home_shots_ot if m <= clock)
+        a_sot = sum(1 for m in away_shots_ot if m <= clock)
+
+        h_xg = sum(x for m, x in home_xg if m <= clock)
+        a_xg = sum(x for m, x in away_xg if m <= clock)
+
+        h_cards = sum(1 for m in home_cards if m <= clock)
+        a_cards = sum(1 for m in away_cards if m <= clock)
+
+        goals_last10 = sum(1 for m in home_goals + away_goals if clock - 10 < m <= clock)
+        cards_last15 = sum(1 for m in home_cards + away_cards if clock - 15 < m <= clock)
+
+        # Running xG momentum (last 15 min window)
+        h_xg_recent = sum(x for m, x in home_xg if clock - 15 < m <= clock)
+        a_xg_recent = sum(x for m, x in away_xg if clock - 15 < m <= clock)
+        momentum = h_xg_recent - a_xg_recent
+
+        snapshots.append({
+            "match_id": match_id,
+            "source": "statsbomb",
+            "clock_minutes": float(clock),
+            "score_diff": float(score_diff),
+            "is_extra_time": float(clock > 90),
+            "home_red_cards": float(h_cards),
+            "away_red_cards": float(a_cards),
+            "home_pressure_score": 0.5,
+            "goals_in_last_10min": float(goals_last10),
+            "home_shots_on_target": float(h_sot),
+            "away_shots_on_target": float(a_sot),
+            "home_xg_running": float(h_xg),
+            "away_xg_running": float(a_xg),
+            "score_diff_x_time_remaining": float(score_diff * max(90 - clock, 0)),
+            "home_elo": 1500.0,
+            "away_elo": 1500.0,
+            "elo_diff": 0.0,
+            "home_form_pts": 0.0,
+            "away_form_pts": 0.0,
+            "h2h_home_winrate": 0.4,
+            "is_home_game": 1.0,
+            "referee_cards_per_game": 3.5,
+            "home_squad_value_EUR": 5e8,
+            "away_squad_value_EUR": 5e8,
+            "squad_value_ratio": 1.0,
+            "home_injuries_count": 0.0,
+            "away_injuries_count": 0.0,
+            "home_press_pct": 0.5,
+            "away_press_pct": 0.5,
+            "home_xg_last5": float(h_xg),
+            "away_xg_last5": float(a_xg),
+            "home_xga_last5": float(a_xg),
+            "away_xga_last5": float(h_xg),
+            "competition_tier": 2.0,
+            "match_importance": 0.5,
+            "days_since_last_match_home": 7.0,
+            "days_since_last_match_away": 7.0,
+            "goals_last_15min": float(goals_last10),
+            "cards_last_15min": float(cards_last15),
+            "score_diff_squared": float(score_diff ** 2),
+            "momentum_shift": float(momentum),
+            "target": target,
+        })
+
+    return snapshots
 
 
 def fetch_understat(league: str = "EPL") -> pd.DataFrame:
@@ -101,20 +313,15 @@ def fetch_understat(league: str = "EPL") -> pd.DataFrame:
         import requests
         from bs4 import BeautifulSoup
 
-        # Understat uses JavaScript-rendered data
         url = f"https://understat.com/league/{league}"
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
         resp = requests.get(url, headers=headers, timeout=60)
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Extract JSON data from script tags
         scripts = soup.find_all("script")
         for script in scripts:
             if "teamsData" in str(script):
-                # Parse the JSON
-                import json
                 import re
-
                 text = str(script)
                 match = re.search(r"var teamsData\s*=\s*JSON\.parse\('(.+?)'\)", text)
                 if match:
@@ -150,8 +357,6 @@ def _parse_understat_data(data: dict, league: str) -> pd.DataFrame:
 def fetch_european_soccer_db() -> pd.DataFrame:
     """Load European Soccer Database from local CSV.
 
-    Download from Kaggle: https://www.kaggle.com/datasets/hugomathien/soccer
-
     Returns:
         DataFrame with match data.
     """
@@ -165,114 +370,12 @@ def fetch_european_soccer_db() -> pd.DataFrame:
     return df
 
 
-def build_snapshots_from_matches(
-    matches_df: pd.DataFrame,
-    source: str = "statsbomb",
-) -> List[Dict]:
-    """Convert match data to game-state snapshots at 5-minute intervals.
-
-    Args:
-        matches_df: Raw match data.
-        source: Data source identifier.
-
-    Returns:
-        List of snapshot dictionaries.
-    """
-    snapshots = []
-
-    for match_id, group in matches_df.groupby("match_id"):
-        # Sort by time
-        if "timestamp" in group.columns:
-            group = group.sort_values("timestamp")
-
-        # Create snapshots at 5-minute intervals
-        for clock in range(0, 95, 5):
-            snapshot = _create_snapshot_at_clock(group, clock, match_id, source)
-            if snapshot:
-                snapshots.append(snapshot)
-
-    return snapshots
-
-
-def _create_snapshot_at_clock(
-    events: pd.DataFrame,
-    clock: int,
-    match_id: str,
-    source: str,
-) -> Optional[Dict]:
-    """Create a single snapshot at a given clock time."""
-    # Filter events up to this clock time
-    if "minute" in events.columns:
-        prior = events[events["minute"] <= clock]
-    else:
-        return None
-
-    if len(prior) == 0:
-        return None
-
-    # Count goals
-    home_goals = 0
-    away_goals = 0
-    if "type" in prior.columns:
-        goals = prior[prior["type"] == "Shot"]
-        # Simplified goal counting
-        home_goals = len(goals[goals.get("shot_outcome", "") == "Goal"]) if "shot_outcome" in goals.columns else 0
-        away_goals = 0  # Would need team attribution
-
-    # Compute features
-    score_diff = home_goals - away_goals
-
-    return {
-        "match_id": str(match_id),
-        "source": source,
-        "clock_minutes": clock,
-        "home_score": home_goals,
-        "away_score": away_goals,
-        "score_diff": score_diff,
-        "score_diff_x_time_remaining": score_diff * (90 - clock),
-        "target": _get_final_result(events),
-    }
-
-
-def _get_final_result(events: pd.DataFrame) -> int:
-    """Determine final match result from events."""
-    if "shot_outcome" in events.columns:
-        goals = events[events["type"] == "Shot"]
-        home_goals = len(goals[goals["shot_outcome"] == "Goal"])
-    else:
-        home_goals = 0
-
-    # Simplified — would need proper team attribution
-    if home_goals > 1:
-        return 0  # home win
-    elif home_goals == 1:
-        return 1  # draw
-    else:
-        return 2  # away win
-
-
-def _process_match_events(events: pd.DataFrame, match: pd.Series) -> List[Dict]:
-    """Process StatsBomb events into snapshots."""
-    snapshots = []
-    match_id = match.get("match_id", "")
-
-    for clock in range(0, 95, 5):
-        snapshot = _create_snapshot_at_clock(events, clock, match_id, "statsbomb")
-        if snapshot:
-            snapshots.append(snapshot)
-
-    return snapshots
-
-
 def generate_synthetic_data(
     n_matches: int = 1000,
     snapshots_per_match: int = 19,
     output_path: str = "data/train.parquet",
 ) -> pd.DataFrame:
     """Generate synthetic training data for pipeline testing.
-
-    Creates realistic game-state snapshots with correlated features
-    and targets based on simple heuristic rules.
 
     Args:
         n_matches: Number of synthetic matches.
@@ -288,7 +391,6 @@ def generate_synthetic_data(
     for match_idx in range(n_matches):
         match_id = f"synth_{match_idx:06d}"
 
-        # Pre-match features (fixed per match)
         home_elo = rng.normal(1500, 200)
         away_elo = rng.normal(1500, 200)
         elo_diff = home_elo - away_elo
@@ -308,19 +410,16 @@ def generate_synthetic_data(
         days_away = rng.integers(2, 14)
         ref_cards = rng.uniform(2.5, 5.0)
 
-        # Generate match outcome based on ELO + form
-        home_strength = elo_diff / 400 + home_form / 15 + 0.1  # home advantage
+        home_strength = elo_diff / 400 + home_form / 15 + 0.1
         home_win_prob = 1 / (1 + 10 ** (-home_strength))
         draw_prob = 0.25
         away_win_prob = 1 - home_win_prob - draw_prob
 
-        # Clamp and normalize
         probs = np.array([home_win_prob, draw_prob, away_win_prob])
         probs = np.clip(probs, 0.01, None)
         probs /= probs.sum()
         outcome = rng.choice([0, 1, 2], p=probs)
 
-        # Simulate goals
         if outcome == 0:
             final_home = rng.integers(1, 5)
             final_away = rng.integers(0, final_home)
@@ -331,13 +430,11 @@ def generate_synthetic_data(
             final_home = rng.integers(0, 4)
             final_away = final_home
 
-        # Generate snapshots at 5-minute intervals
         for snap_idx in range(snapshots_per_match):
             clock = snap_idx * 5
             if clock > 90:
                 clock = 90
 
-            # Current score (proportional to time)
             progress = clock / 90
             home_score = int(final_home * progress * rng.uniform(0.8, 1.2))
             away_score = int(final_away * progress * rng.uniform(0.8, 1.2))
@@ -345,17 +442,14 @@ def generate_synthetic_data(
             away_score = min(away_score, final_away)
             score_diff = home_score - away_score
 
-            # xG (correlated with goals)
             home_xg = home_score * rng.uniform(0.8, 1.5) + rng.normal(0, 0.3)
             away_xg = away_score * rng.uniform(0.8, 1.5) + rng.normal(0, 0.3)
             home_xg = max(home_xg, 0)
             away_xg = max(away_xg, 0)
 
-            # Running xG
             home_xg_run = home_xg * progress
             away_xg_run = away_xg * progress
 
-            # Other features
             pressure = rng.uniform(0.3, 0.7)
             if score_diff > 0:
                 pressure = rng.uniform(0.5, 0.8)
@@ -366,7 +460,6 @@ def generate_synthetic_data(
             red_cards_h = 1 if rng.random() < 0.05 else 0
             red_cards_a = 1 if rng.random() < 0.05 else 0
 
-            # Momentum
             xg5_home = home_xg * rng.uniform(0.5, 1.5)
             xg5_away = away_xg * rng.uniform(0.5, 1.5)
             xga5_home = away_xg * rng.uniform(0.5, 1.5)
@@ -448,8 +541,8 @@ def build_dataset(output_path: str = "data/train.parquet") -> pd.DataFrame:
     start = time.time()
     all_dfs = []
 
-    # 1. StatsBomb
-    statsbomb_df = fetch_statsbomb()
+    # 1. StatsBomb (from GitHub — no API needed)
+    statsbomb_df = fetch_statsbomb_github(max_matches=500)
     if len(statsbomb_df) > 0:
         all_dfs.append(statsbomb_df)
 
@@ -482,7 +575,7 @@ def build_dataset(output_path: str = "data/train.parquet") -> pd.DataFrame:
 
     # Add target if not present
     if "target" not in combined.columns:
-        combined["target"] = 1  # Default to draw
+        combined["target"] = 1
 
     # Save
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
