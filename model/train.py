@@ -380,6 +380,11 @@ def train(
     X_train, y_train = X[train_mask], y[train_mask]
     X_val, y_val = X[val_mask], y[val_mask]
 
+    # Shuffle training data to prevent class-ordered splits
+    train_shuffle = np.random.permutation(len(X_train))
+    X_train = X_train[train_shuffle]
+    y_train = y_train[train_shuffle]
+
     logger.info(
         "Split: %d train, %d val (%d train matches, %d val matches)",
         len(X_train), len(X_val), len(train_matches), len(val_matches),
