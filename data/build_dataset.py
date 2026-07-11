@@ -26,6 +26,22 @@ from model.features import FEATURE_NAMES
 
 logger = logging.getLogger(__name__)
 
+# Detect environment for persistent caching
+LIGHTNING_TEAMSPACE = Path("/teamspace")
+OVH_OUTPUT = Path("/workspace/output")
+
+if LIGHTNING_TEAMSPACE.exists():
+    CACHE_BASE = LIGHTNING_TEAMSPACE / "cache"
+elif OVH_OUTPUT.exists():
+    CACHE_BASE = OVH_OUTPUT / "cache"
+else:
+    CACHE_BASE = Path("./cache")
+
+CACHE_BASE.mkdir(parents=True, exist_ok=True)
+STATSBOMB_CLONE_DIR = CACHE_BASE / "statsbomb_open_data"
+STATSBOMB_EVENTS_DIR = CACHE_BASE / "statsbomb_events"
+STATSBOMB_EVENTS_DIR.mkdir(exist_ok=True)
+
 # Timeout helper (replaces signal.SIGALRM for Docker compatibility)
 def _run_with_timeout(func, timeout_sec, *args, **kwargs):
     """Run func with a timeout. Returns (result, timed_out)."""
@@ -62,8 +78,8 @@ def fetch_statsbomb_github(max_matches: int = 10000) -> pd.DataFrame:
     """
     logger.info("Fetching StatsBomb data from GitHub...")
 
-    clone_dir = Path("/tmp/statsbomb_open_data")
-    events_dir = Path("/tmp/statsbomb_events")
+    clone_dir = STATSBOMB_CLONE_DIR
+    events_dir = STATSBOMB_EVENTS_DIR
     events_dir.mkdir(exist_ok=True)
 
     # Step 1: Get match metadata (competitions + matches JSON)
@@ -829,8 +845,8 @@ def build_dataset(output_path: str = "data/train.parquet") -> pd.DataFrame:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
 
-    # Checkpoint to Object Storage if available
-    checkpoint_dir = Path("/workspace/output/data")
+    # Checkpoint to persistent storage if available
+    checkpoint_dir = CACHE_BASE / "data"
     if checkpoint_dir.parent.exists():
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = checkpoint_dir / "train_enriched.parquet"

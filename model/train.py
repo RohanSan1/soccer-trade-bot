@@ -30,9 +30,21 @@ from model.features import FEATURE_NAMES
 
 logger = logging.getLogger(__name__)
 
-# Checkpoint directory (Object Storage mount)
-CHECKPOINT_DIR = Path("/workspace/output/checkpoints")
-MODEL_DIR = Path("/workspace/output/model")
+# Checkpoint directory - supports OVH (/workspace/output) and Lightning AI (/teamspace)
+import os
+LIGHTNING_TEAMSPACE = Path("/teamspace")
+OVH_OUTPUT = Path("/workspace/output")
+
+if LIGHTNING_TEAMSPACE.exists():
+    CHECKPOINT_DIR = LIGHTNING_TEAMSPACE / "checkpoints"
+    MODEL_DIR = LIGHTNING_TEAMSPACE / "model"
+elif OVH_OUTPUT.exists():
+    CHECKPOINT_DIR = OVH_OUTPUT / "checkpoints"
+    MODEL_DIR = OVH_OUTPUT / "model"
+else:
+    # Local development fallback
+    CHECKPOINT_DIR = Path("./checkpoints")
+    MODEL_DIR = Path("./model")
 
 
 def load_training_data(
@@ -768,7 +780,7 @@ def train(
     # Save to local output
     ensemble.save(output_dir)
 
-    # Checkpoint to Object Storage
+    # Checkpoint to Object Storage / Teamspace
     if MODEL_DIR.parent.exists():
         ensemble.save(str(MODEL_DIR))
         logger.info("Model checkpointed to %s", MODEL_DIR)
