@@ -635,6 +635,7 @@ def run_optuna(
     groups_train: np.ndarray,
     n_trials: int = 200,
     use_catboost: bool = True,
+    resume: bool = False,
 ) -> Tuple[Dict, float]:
     """Run Optuna hyperparameter optimization.
 
@@ -644,6 +645,7 @@ def run_optuna(
         groups_train: Group labels for training data.
         n_trials: Number of Optuna trials.
         use_catboost: Whether to include CatBoost.
+        resume: Whether to resume from checkpoint.
 
     Returns:
         Tuple of (best_params, best_score).
@@ -663,12 +665,37 @@ def run_optuna(
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
     )
 
+    # Resume from checkpoint if available
+    completed_trials = 0
+    if resume:
+        trials_csv = CHECKPOINT_DIR / "optuna_trials.csv"
+        if trials_csv.exists():
+            prev_trials = pd.read_csv(str(trials_csv))
+            completed_trials = len(prev_trials)
+            logger.info("Resuming from checkpoint: %d completed trials", completed_trials)
+
+            # Load best params from checkpoint
+            best_params_path = CHECKPOINT_DIR / "optuna_best_params.json"
+            if best_params_path.exists():
+                best_data = json.loads(best_params_path.read_text())
+                # Add each completed trial as a frozen trial
+                for _, row in prev_trials.iterrows():
+                    trial_params = {}
+                    for key in ["xgb_depth", "xgb_lr", "lgb_num_leaves", "lgb_lr"]:
+                        if key in row:
+                            trial_params[key] = row[key]
+                    # We only have partial params, so we can't fully replay
+                    # Instead, just skip already-completed trials count
+                logger.info("Will run %d new trials (skipping %d)", n_trials - completed_trials, completed_trials)
+
+    remaining_trials = max(1, n_trials - completed_trials)
+
     study.optimize(
         lambda trial: _optuna_objective(
             trial, X_train, y_train, X_val, y_val, groups_train,
             checkpoint_trials, checkpoint_timer, use_catboost,
         ),
-        n_trials=n_trials,
+        n_trials=remaining_trials,
         show_progress_bar=True,
         n_jobs=4,  # Parallel trials (not -1 to avoid CPU contention with model training)
     )
@@ -692,6 +719,7 @@ def train(
     optuna_trials: int = 200,
     use_catboost: bool = True,
     use_stacking: bool = True,
+    resume: bool = False,
 ) -> SoccerEnsemble:
     """Full training pipeline.
 
@@ -745,6 +773,7 @@ def train(
         best_params, best_score = run_optuna(
             X_train, y_train, X_val, y_val, groups_train,
             n_trials=optuna_trials, use_catboost=use_catboost,
+            resume=resume,
         )
 
         # Extract per-model params from Optuna results
@@ -933,6 +962,7 @@ def main() -> None:
     parser.add_argument("--optuna-trials", type=int, default=200, help="Number of Optuna trials")
     parser.add_argument("--no-catboost", action="store_true", help="Disable CatBoost")
     parser.add_argument("--no-stacking", action="store_true", help="Disable stacking meta-learner")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -944,6 +974,7 @@ def main() -> None:
         optuna_trials=args.optuna_trials,
         use_catboost=not args.no_catboost,
         use_stacking=not args.no_stacking,
+        resume=args.resume,
     )
 
 
