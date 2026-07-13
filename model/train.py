@@ -207,6 +207,7 @@ def train_xgboost(
         "eval_metric": "mlogloss",
         "tree_method": "hist",
         "random_state": 42,
+        "nthread": 2,
     }
 
     if params:
@@ -264,7 +265,7 @@ def train_lightgbm(
             "metric": "multi_logloss",
             "boosting_type": "gbdt",
             "random_state": 42,
-            "n_jobs": -1,
+            "n_jobs": 2,
             "verbose": -1,
         }
         lgb_params.update(params)
@@ -284,7 +285,7 @@ def train_lightgbm(
             "reg_alpha": 0.1,
             "reg_lambda": 0.1,
             "random_state": 42,
-            "n_jobs": -1,
+            "n_jobs": 2,
             "verbose": -1,
         }
 
@@ -669,7 +670,7 @@ def run_optuna(
         ),
         n_trials=n_trials,
         show_progress_bar=True,
-        n_jobs=-1,  # Parallel Optuna trials
+        n_jobs=4,  # Parallel trials (not -1 to avoid CPU contention with model training)
     )
 
     best_params = study.best_params
