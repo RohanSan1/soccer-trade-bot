@@ -932,9 +932,10 @@ def train(
                 oof_all[oof_val_idx] = (oof_xgb + oof_lgbm) / 2.0
 
         # Train stacking meta-learner
+        # OOF predictions are averaged (N,3), so validation must be too
+        val_averaged = (xgb_probs + lgbm_probs + (cb_probs if cb_model is not None else xgb_probs)) / (3 if cb_model is not None else 2)
         stack_meta, stack_calibrator, stack_ll = train_stacking_meta(
-            oof_all, y_train, np.column_stack([xgb_probs, lgbm_probs, cb_probs]) if cb_model is not None else np.column_stack([xgb_probs, lgbm_probs]),
-            y_val,
+            oof_all, y_train, val_averaged, y_val,
         )
         stacking_ok = True
     except Exception as e:
