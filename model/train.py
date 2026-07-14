@@ -697,7 +697,7 @@ def run_optuna(
         ),
         n_trials=remaining_trials,
         show_progress_bar=True,
-        n_jobs=4,  # Parallel trials (not -1 to avoid CPU contention with model training)
+        n_jobs=16,  # 16 parallel trials for 16-core CPU
     )
 
     best_params = study.best_params
