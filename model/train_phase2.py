@@ -388,8 +388,11 @@ class SoccerEnsemblePhase2:
         ensemble = sum(w * p for w, p in zip(weights, probs))
 
         # Calibrate if available
-        if self.calibrator is not None:
-            ensemble = self.calibrator.predict(ensemble)
+        if self.calibrator is not None and hasattr(self.calibrator, 'predict') and callable(self.calibrator.predict):
+            try:
+                ensemble = self.calibrator.predict(ensemble)
+            except Exception as e:
+                logger.warning("Calibration failed: %s", e)
 
         return ensemble
 
@@ -467,7 +470,15 @@ class SoccerEnsemblePhase2:
 
         cal_path = model_path / "calibrator.pkl"
         if cal_path.exists():
-            calibrator = joblib.load(cal_path)
+            try:
+                calibrator = joblib.load(cal_path)
+                # Validate calibrator is the right type
+                if not hasattr(calibrator, 'predict') or not callable(calibrator.predict):
+                    logger.warning("Invalid calibrator type: %s, resetting", type(calibrator))
+                    calibrator = None
+            except Exception as e:
+                logger.warning("Failed to load calibrator: %s", e)
+                calibrator = None
 
         # Load meta
         meta_path = model_path / "ensemble_meta.json"
