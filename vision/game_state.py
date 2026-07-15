@@ -73,7 +73,7 @@ class GameState:
     away_team: str = ""
 
     # Clock
-    clock_minutes: int = 0
+    clock_minutes: float = 0.0  # Float for stoppage time precision (e.g., 90.5 = 90+30s)
     stoppage_time: int = 0
     is_extra_time: bool = False
 
@@ -113,10 +113,10 @@ class GameState:
     away_injuries_count: int = 0
     home_press_pct: float = 0.0
     away_press_pct: float = 0.0
-    home_xg_last5: float = 0.0
-    away_xg_last5: float = 0.0
-    home_xga_last5: float = 0.0
-    away_xga_last5: float = 0.0
+    home_xg_last5: float = 0.0  # Actually cumulative match xG (not rolling 5-match)
+    away_xg_last5: float = 0.0  # Actually cumulative match xG (not rolling 5-match)
+    home_xga_last5: float = 0.0  # Actually away cumulative xG
+    away_xga_last5: float = 0.0  # Actually home cumulative xG
     competition_tier: int = 2
     match_importance: float = 0.5
     days_since_last_match_home: int = 7
@@ -127,8 +127,8 @@ class GameState:
     event_confidence: float = 0.0
 
     # Historical tracking for momentum
-    _score_history: List[int] = field(default_factory=list, repr=False)
-    _xg_history: List[float] = field(default_factory=list, repr=False)
+    _score_history: list = field(default_factory=list, repr=False)  # [(minute, score_diff), ...]
+    _xg_history: list = field(default_factory=list, repr=False)  # [(minute, total_xg), ...]
 
     @property
     def score_diff(self) -> int:
@@ -174,7 +174,7 @@ class GameState:
             "home_red_cards": float(self.home_red_cards),
             "away_red_cards": float(self.away_red_cards),
             "home_pressure_score": self.home_pressure_score,
-            "goals_in_last_10min": float(self.goals_in_last_10min),
+            "goals_in_last_10min": float(self.goals_in_window(10)),
             "home_shots_on_target": float(self.home_shots_on_target),
             "away_shots_on_target": float(self.away_shots_on_target),
             "home_xg_running": self.home_xg_running,
@@ -209,8 +209,8 @@ class GameState:
             "days_since_last_match_home": float(self.days_since_last_match_home),
             "days_since_last_match_away": float(self.days_since_last_match_away),
             # Momentum
-            "goals_last_15min": float(self.goals_last_15min),
-            "cards_last_15min": float(self.cards_last_15min),
+            "goals_last_15min": float(self.goals_in_window(15)),
+            "cards_last_15min": float(self.cards_in_window(15)),
             "score_diff_squared": self.score_diff_squared,
             "momentum_shift": self.momentum_shift,
             # v2 interaction features
@@ -250,21 +250,59 @@ class GameState:
         self.away_score = away
         self.consecutive_consistent_reads = 1
 
-        # Track score history for momentum
-        self._score_history.append(self.score_diff)
+        # Track score history with timestamp for windowed queries
+        self._score_history.append((self.clock_minutes, self.score_diff))
 
         return self.score_diff != old_diff
 
+    def goals_in_window(self, window_minutes: int) -> int:
+        """Count goals scored in the last N minutes.
+
+        Args:
+            window_minutes: How many minutes back to look.
+
+        Returns:
+            Number of goals scored in the window.
+        """
+        if not self._score_history or self.clock_minutes <= 0:
+            return 0
+
+        start_minute = max(0, self.clock_minutes - window_minutes)
+        goals = 0
+
+        for i in range(1, len(self._score_history)):
+            prev_minute, prev_diff = self._score_history[i - 1]
+            curr_minute, curr_diff = self._score_history[i]
+
+            # Only count goals within the time window
+            if curr_minute >= start_minute and abs(curr_diff - prev_diff) > 0:
+                goals += 1
+
+        return goals
+
+    def cards_in_window(self, window_minutes: int) -> int:
+        """Count cards shown in the last N minutes (placeholder).
+
+        Returns:
+            Number of cards (currently returns 0 — needs event data).
+        """
+        # TODO: Track card events with timestamps like score history
+        return 0
+
     def update_xg(self, home_xg: float, away_xg: float) -> None:
         """Update cumulative xG and compute momentum shift."""
-        prev_total = self.home_xg_running + self.away_xg_running
         self.home_xg_running = home_xg
         self.away_xg_running = away_xg
         new_total = home_xg + away_xg
 
-        self._xg_history.append(new_total)
-        if len(self._xg_history) >= 5:
-            self.momentum_shift = new_total - self._xg_history[-5]
+        self._xg_history.append((self.clock_minutes, new_total))
+
+        # Compute momentum as delta xG over time window
+        if len(self._xg_history) >= 2:
+            prev_minute, prev_total = self._xg_history[-2]
+            curr_minute, curr_total = self._xg_history[-1]
+            delta_minutes = max(curr_minute - prev_minute, 1)
+            self.momentum_shift = (curr_total - prev_total) / delta_minutes
 
     @property
     def is_active(self) -> bool:

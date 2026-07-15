@@ -275,10 +275,33 @@ class OCRPipeline:
         """Check if OCR extraction meets confidence threshold."""
         return data.overall_confidence >= self.confidence_threshold
 
-    def parse_clock_minutes(self, clock_text: str) -> int:
-        """Parse clock text to integer minutes."""
+    def parse_clock_minutes(self, clock_text: str) -> float:
+        """Parse clock text to float minutes.
+
+        Handles formats like:
+        - "45" -> 45.0
+        - "45+2" -> 92.0 (stoppage time)
+        - "90:30" -> 90.5 (seconds as decimal)
+        - "45'" -> 45.0
+        """
         try:
+            # Handle stoppage time format: "45+2" -> 47
+            stoppage_match = re.match(r"(\d{1,3})\+(\d{1,2})", clock_text)
+            if stoppage_match:
+                base = int(stoppage_match.group(1))
+                stoppage = int(stoppage_match.group(2))
+                return min(float(base + stoppage), 120.0)
+
+            # Handle seconds format: "90:30" -> 90.5
+            seconds_match = re.match(r"(\d{1,3}):(\d{2})", clock_text)
+            if seconds_match:
+                minutes = int(seconds_match.group(1))
+                seconds = int(seconds_match.group(2))
+                return min(float(minutes) + seconds / 60.0, 120.0)
+
+            # Simple minutes
             minutes = int(re.findall(r"\d+", clock_text)[0])
-            return min(minutes, 120)  # Cap at 120
+            return min(float(minutes), 120.0)
+
         except (IndexError, ValueError):
-            return 0
+            return 0.0

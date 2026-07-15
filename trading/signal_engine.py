@@ -121,9 +121,18 @@ class SignalEngine:
                 logger.debug("OCR not reliable, skipping")
                 return result
 
-            # 3. Skip if in final minutes
-            if state.clock_minutes > 85:
+            # 3. Dynamic clock cutoff — best edge in 75-85 window when markets lag
+            clock = state.clock_minutes
+            score_diff = abs(state.score_diff)
+            if clock > 85:
                 logger.debug("Clock > 85 min, skipping")
+                return result
+            elif clock > 80 and score_diff == 0:
+                # Draw game late: still have edge as market lags
+                pass
+            elif clock > 78 and score_diff >= 2:
+                # Blowout: market should be efficient by now
+                logger.debug("Blowout at minute %d, skipping", clock)
                 return result
 
             # 4. Predict win probabilities
@@ -138,8 +147,20 @@ class SignalEngine:
                 return result
             result.market_prices = market_prices
 
-            # 6. Calculate edge
-            edge_analysis = self.edge_calculator.calculate(model_probs, market_prices)
+            # 6. Calculate edge (with spread awareness)
+            # Build bid/ask dicts from market_prices (None = no market)
+            market_bids = {}
+            market_asks = {}
+            for outcome, price in market_prices.items():
+                if price is not None and price > 0:
+                    # Use midpoint as both bid/ask for now
+                    # TODO: fetch actual orderbook depth
+                    market_bids[outcome] = price
+                    market_asks[outcome] = price
+
+            edge_analysis = self.edge_calculator.calculate(
+                model_probs, market_prices, market_bids, market_asks,
+            )
             result.edge_analysis = edge_analysis
 
             # 7. Log signal
@@ -164,6 +185,7 @@ class SignalEngine:
                     edges={k: v.edge for k, v in edge_analysis.edges.items()},
                     market_probs=market_prices,
                     bankroll=self.bankroll,
+                    model_probs=model_probs,
                 )
 
                 for bet in bets:

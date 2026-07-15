@@ -143,7 +143,7 @@ def compute_momentum(
 
 
 def compute_goals_in_window(
-    score_history: List[int],
+    score_history: list,
     window_minutes: int,
     current_minute: int,
 ) -> int:
@@ -157,13 +157,18 @@ def compute_goals_in_window(
     Returns:
         Number of goals scored in the window.
     """
+    if not score_history or current_minute <= 0:
+        return 0
+
     start_minute = max(0, current_minute - window_minutes)
     goals = 0
 
     for i in range(1, len(score_history)):
-        prev_diff = score_history[i - 1]
-        curr_diff = score_history[i]
-        if abs(curr_diff - prev_diff) > 0:
+        prev_minute, prev_diff = score_history[i - 1]
+        curr_minute, curr_diff = score_history[i]
+
+        # Only count goals within the time window
+        if curr_minute >= start_minute and abs(curr_diff - prev_diff) > 0:
             goals += 1
 
     return goals

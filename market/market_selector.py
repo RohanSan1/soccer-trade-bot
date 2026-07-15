@@ -142,7 +142,7 @@ class MarketSelector:
             if book:
                 return {
                     "home": book.best_bid,
-                    "draw": 0.0,  # Would need separate market
+                    "draw": None,  # No draw market available
                     "away": 1.0 - book.best_ask,
                 }
 
@@ -151,7 +151,7 @@ class MarketSelector:
             if book:
                 return {
                     "home": book.yes_bid,
-                    "draw": 0.0,
+                    "draw": None,  # No draw market available
                     "away": book.no_bid,
                 }
 
