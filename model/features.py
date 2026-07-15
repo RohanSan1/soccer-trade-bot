@@ -1,6 +1,6 @@
 """Feature engineering from GameState.
 
-Converts raw GameState snapshots into 38-feature vectors for model training/inference.
+Converts raw GameState snapshots into 51-feature vectors for model training/inference.
 Handles time-decay interactions, momentum computation, and pre-match enrichment.
 """
 from __future__ import annotations
@@ -97,20 +97,20 @@ def state_to_array(state: GameState) -> np.ndarray:
         state: Current game state snapshot.
 
     Returns:
-        numpy array of shape (1, 38) in canonical feature order.
+        numpy array of shape (1, 51) in canonical feature order.
     """
     vec = state.to_feature_vector()
     return np.array([[vec[name] for name in FEATURE_NAMES]], dtype=np.float32)
 
 
 def batch_states_to_array(states: List[GameState]) -> np.ndarray:
-    """Convert multiple GameStates to numpy array (N, 39).
+    """Convert multiple GameStates to numpy array (N, 51).
 
     Args:
         states: List of game state snapshots.
 
     Returns:
-        numpy array of shape (N, 39).
+        numpy array of shape (N, 51).
     """
     return np.vstack([state_to_array(s) for s in states])
 
@@ -215,7 +215,7 @@ def create_training_snapshot(
         final_result: 0=home win, 1=draw, 2=away win (None for inference).
 
     Returns:
-        Dictionary of 38 features.
+        Dictionary of 51 features.
     """
     score_diff = home_goals - away_goals
 

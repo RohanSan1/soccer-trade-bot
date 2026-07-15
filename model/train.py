@@ -433,7 +433,7 @@ class SoccerEnsemble:
         """Predict for a single sample.
 
         Args:
-            X: Feature array (1, 39).
+            X: Feature array (1, 51).
 
         Returns:
             Calibrated probabilities (3,).

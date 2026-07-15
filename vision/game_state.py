@@ -1,7 +1,7 @@
 """Unified GameState dataclass.
 
 Central data structure shared across all pipeline modules.
-Contains 38 features derived from vision, OCR, and pre-match data.
+Contains 51 features derived from vision, OCR, and pre-match data.
 """
 from __future__ import annotations
 
@@ -164,7 +164,7 @@ class GameState:
         """Convert to feature dictionary for model input.
 
         Returns:
-            Dictionary of 38 features matching the training schema.
+            Dictionary of 51 features matching the training schema.
         """
         return {
             # Live state
@@ -213,6 +213,19 @@ class GameState:
             "cards_last_15min": float(self.cards_last_15min),
             "score_diff_squared": self.score_diff_squared,
             "momentum_shift": self.momentum_shift,
+            # v2 interaction features
+            "xg_diff": float(self.home_xg_running - self.away_xg_running),
+            "xg_total": float(self.home_xg_running + self.away_xg_running),
+            "form_diff": float(self.home_form_pts - self.away_form_pts),
+            "elo_xg_interaction": float(self.elo_diff * (self.home_xg_running - self.away_xg_running)),
+            "pressure_x_time_remaining": float(self.home_pressure_score * max(90 - self.clock_minutes, 0)),
+            "clock_normalized": float(self.clock_minutes / 90.0),
+            "home_dominance": float((self.home_xg_running - self.away_xg_running) / max(self.home_xg_running + self.away_xg_running, 0.1)),
+            "score_xg_consistent": 1.0 if (self.score_diff > 0 and self.home_xg_running > self.away_xg_running) or (self.score_diff < 0 and self.home_xg_running < self.away_xg_running) or (self.score_diff == 0 and abs(self.home_xg_running - self.away_xg_running) < 0.3) else 0.0,
+            "late_game_state": 1.0 if (self.clock_minutes > 75 and self.score_diff != 0) else 0.0,
+            "home_xg_per_minute": float(self.home_xg_running / max(self.clock_minutes, 1)),
+            "away_xg_per_minute": float(self.away_xg_running / max(self.clock_minutes, 1)),
+            "xg_momentum_ratio": float(self.momentum_shift / max(self.home_xg_running + self.away_xg_running, 0.1)),
         }
 
     def update_score(self, home: int, away: int) -> bool:
