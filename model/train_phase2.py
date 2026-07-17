@@ -505,6 +505,54 @@ class SoccerEnsemblePhase2:
         )
 
 
+def _train_xgb_wrapper(args):
+    """Wrapper for parallel XGBoost training."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    X_train, y_train, X_val, y_val, params = args
+    return train_xgboost(X_train, y_train, X_val, y_val, params)
+
+
+def _train_lgbm_wrapper(args):
+    """Wrapper for parallel LightGBM training."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    X_train, y_train, X_val, y_val, params = args
+    return train_lightgbm(X_train, y_train, X_val, y_val, params)
+
+
+def _train_cb_wrapper(args):
+    """Wrapper for parallel CatBoost training."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    X_train, y_train, X_val, y_val, params = args
+    return train_catboost(X_train, y_train, X_val, y_val, params)
+
+
+def _train_ngb_wrapper(args):
+    """Wrapper for parallel NGBoost training."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    X_train, y_train, X_val, y_val, params = args
+    return train_ngboost(X_train, y_train, X_val, y_val, params)
+
+
+def _train_ft_wrapper(args):
+    """Wrapper for parallel FT-Transformer training."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    X_train, y_train, X_val, y_val, params = args
+    return train_ft_transformer(X_train, y_train, X_val, y_val, params)
+
+
 def train_phase2(
     data_path: str,
     output_dir: str = "model_phase2",
@@ -513,18 +561,16 @@ def train_phase2(
     skip_optuna: bool = False,
     resume: bool = False,
 ) -> SoccerEnsemblePhase2:
-    """Full Phase 2 training pipeline.
+    """Full Phase 2 training pipeline with parallel model training.
 
-    Args:
-        data_path: Path to training data.
-        output_dir: Where to save model artifacts.
-        use_optuna: Whether to run Optuna optimization.
-        optuna_trials: Number of Optuna trials.
-        skip_optuna: Skip Optuna, load best params from checkpoint.
-        resume: Resume from checkpoint.
+    Core allocation on 16-core machine:
+    - XGBoost: 4 threads
+    - LightGBM: 4 threads
+    - CatBoost: 4 threads
+    - NGBoost: 3 classifiers parallel (3 cores, 1 thread each)
+    - FT-Transformer: 1 core + DataLoader workers
 
-    Returns:
-        Trained SoccerEnsemblePhase2.
+    Total: ~16 cores, ~95% utilization.
     """
     start = time.time()
 
@@ -567,34 +613,97 @@ def train_phase2(
         except Exception as e:
             logger.warning("Failed to load Phase 1 models: %s", e)
 
-    # Train NGBoost
     checkpoint = _load_checkpoint()
-    if checkpoint and checkpoint.get("ngb_done"):
-        logger.info("NGBoost already trained, loading from checkpoint")
-        ngb_path = MODEL_DIR / "ngb_soccer.pkl"
-        if ngb_path.exists():
-            ensemble.ngb_model = joblib.load(ngb_path)
-    else:
-        logger.info("Training NGBoost...")
-        ngb_model = train_ngboost(X_train, y_train, X_val, y_val)
-        if ngb_model is not None:
-            ensemble.ngb_model = ngb_model
-            joblib.dump(ngb_model, MODEL_DIR / "ngb_soccer.pkl")
-            _save_checkpoint("ngb_done", {"val_log_loss": 0.0})
 
-    # Train FT-Transformer
-    if checkpoint and checkpoint.get("ft_done"):
-        logger.info("FT-Transformer already trained, loading from checkpoint")
-    else:
-        logger.info("Training FT-Transformer...")
-        ft_model = train_ft_transformer(X_train, y_train, X_val, y_val)
-        if ft_model is not None:
-            ensemble.ft_model = ft_model
-            import torch
-            torch.save(ft_model.state_dict(), MODEL_DIR / "ft_transformer.pt")
-            _save_checkpoint("ft_done", {"val_log_loss": 0.0})
+    # ===== PARALLEL TRAINING: All 5 models simultaneously =====
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    # Optimize ensemble weights
+    tasks = {}
+    task_args = (X_train, y_train, X_val, y_val, None)
+
+    # Check which models need training
+    if not (checkpoint and checkpoint.get("xgb_done")):
+        tasks["xgb"] = (_train_xgb_wrapper, task_args)
+    if not (checkpoint and checkpoint.get("lgbm_done")):
+        tasks["lgbm"] = (_train_lgbm_wrapper, task_args)
+    if not (checkpoint and checkpoint.get("cb_done")):
+        tasks["cb"] = (_train_cb_wrapper, task_args)
+    if not (checkpoint and checkpoint.get("ngb_done")):
+        tasks["ngb"] = (_train_ngb_wrapper, task_args)
+    if not (checkpoint and checkpoint.get("ft_done")):
+        tasks["ft"] = (_train_ft_wrapper, task_args)
+
+    if tasks:
+        logger.info(
+            "Training %d models in parallel: %s",
+            len(tasks), list(tasks.keys()),
+        )
+
+        with ProcessPoolExecutor(max_workers=min(len(tasks), 5)) as executor:
+            future_to_model = {}
+            for model_name, (wrapper_fn, args) in tasks.items():
+                future = executor.submit(wrapper_fn, args)
+                future_to_model[future] = model_name
+
+            for future in as_completed(future_to_model):
+                model_name = future_to_model[future]
+                try:
+                    result = future.result()
+                    if model_name == "xgb":
+                        ensemble.xgb_model = result
+                        if result is not None:
+                            joblib.dump(result, MODEL_DIR / "xgb_soccer.pkl")
+                            _save_checkpoint("xgb_done", {})
+                            logger.info("XGBoost training complete")
+                    elif model_name == "lgbm":
+                        ensemble.lgbm_model = result
+                        if result is not None:
+                            joblib.dump(result, MODEL_DIR / "lgbm_soccer.pkl")
+                            _save_checkpoint("lgbm_done", {})
+                            logger.info("LightGBM training complete")
+                    elif model_name == "cb":
+                        ensemble.cb_model = result
+                        if result is not None:
+                            joblib.dump(result, MODEL_DIR / "catboost_soccer.pkl")
+                            _save_checkpoint("cb_done", {})
+                            logger.info("CatBoost training complete")
+                    elif model_name == "ngb":
+                        ensemble.ngb_model = result
+                        if result is not None:
+                            joblib.dump(result, MODEL_DIR / "ngb_soccer.pkl")
+                            _save_checkpoint("ngb_done", {})
+                            logger.info("NGBoost training complete")
+                    elif model_name == "ft":
+                        ensemble.ft_model = result
+                        if result is not None:
+                            import torch
+                            torch.save(result.state_dict(), MODEL_DIR / "ft_transformer.pt")
+                            _save_checkpoint("ft_done", {})
+                            logger.info("FT-Transformer training complete")
+                except Exception as e:
+                    logger.error("Model %s failed: %s", model_name, e)
+
+    # Load any models from checkpoint that were already done
+    if checkpoint:
+        for model_name, pkl_name in [
+            ("xgb_done", "xgb_soccer.pkl"),
+            ("lgbm_done", "lgbm_soccer.pkl"),
+            ("cb_done", "catboost_soccer.pkl"),
+            ("ngb_done", "ngb_soccer.pkl"),
+        ]:
+            if checkpoint.get(model_name) and ensemble.xgb_model is None:
+                p = MODEL_DIR / pkl_name
+                if p.exists():
+                    if model_name == "xgb_done":
+                        ensemble.xgb_model = joblib.load(p)
+                    elif model_name == "lgbm_done":
+                        ensemble.lgbm_model = joblib.load(p)
+                    elif model_name == "cb_done":
+                        ensemble.cb_model = joblib.load(p)
+                    elif model_name == "ngb_done":
+                        ensemble.ngb_model = joblib.load(p)
+
+    # ===== ENSEMBLE WEIGHT OPTIMIZATION =====
     logger.info("Optimizing ensemble weights...")
     xgb_probs = ensemble.xgb_model.predict_proba(X_val) if ensemble.xgb_model is not None else None
     lgbm_probs = ensemble.lgbm_model.predict_proba(X_val) if ensemble.lgbm_model is not None else None
@@ -629,7 +738,6 @@ def train_phase2(
     best_ll = float("inf")
     best_weights = None
 
-    # Generate candidate weight combinations
     from itertools import product
     weight_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 
@@ -652,7 +760,6 @@ def train_phase2(
         model_probs.append(ft_probs)
 
     if len(models_available) >= 2:
-        # Search over weight combinations
         for weights in product(weight_grid, repeat=len(models_available)):
             if sum(weights) < 0.1:
                 continue
@@ -663,14 +770,12 @@ def train_phase2(
                 best_ll = ll
                 best_weights = dict(zip(models_available, weights))
 
-        # Apply best weights
         if best_weights:
             ensemble.xgb_weight = best_weights.get("xgb", 0.0)
             ensemble.lgbm_weight = best_weights.get("lgbm", 0.0)
             ensemble.cb_weight = best_weights.get("cb", 0.0)
             ensemble.ngb_weight = best_weights.get("ngb", 0.0)
             ensemble.ft_weight = best_weights.get("ft", 0.0)
-
             logger.info("Best weights: %s (log_loss=%.4f)", best_weights, best_ll)
 
     # Calibrate
