@@ -512,6 +512,7 @@ def _train_xgb_wrapper(args):
     os.environ["MKL_NUM_THREADS"] = "4"
     os.environ["OPENBLAS_NUM_THREADS"] = "4"
     X_train, y_train, X_val, y_val, params = args
+    from model.train import train_xgboost
     return train_xgboost(X_train, y_train, X_val, y_val, params)
 
 
@@ -522,6 +523,7 @@ def _train_lgbm_wrapper(args):
     os.environ["MKL_NUM_THREADS"] = "4"
     os.environ["OPENBLAS_NUM_THREADS"] = "4"
     X_train, y_train, X_val, y_val, params = args
+    from model.train import train_lightgbm
     return train_lightgbm(X_train, y_train, X_val, y_val, params)
 
 
@@ -532,6 +534,7 @@ def _train_cb_wrapper(args):
     os.environ["MKL_NUM_THREADS"] = "4"
     os.environ["OPENBLAS_NUM_THREADS"] = "4"
     X_train, y_train, X_val, y_val, params = args
+    from model.train import train_catboost
     return train_catboost(X_train, y_train, X_val, y_val, params)
 
 
