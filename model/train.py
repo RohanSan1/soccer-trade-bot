@@ -207,7 +207,7 @@ def train_xgboost(
         "eval_metric": "mlogloss",
         "tree_method": "hist",
         "random_state": 42,
-        "nthread": 2,
+        "nthread": 4,
     }
 
     if params:
@@ -692,13 +692,6 @@ def run_optuna(
 
     remaining_trials = max(1, n_trials - completed_trials)
 
-    # Prevent thread oversubscription: 4 parallel trials × 2 threads each = 8 threads
-    import os
-    os.environ["OMP_NUM_THREADS"] = "2"
-    os.environ["MKL_NUM_THREADS"] = "2"
-    os.environ["OPENBLAS_NUM_THREADS"] = "2"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
-
     study.optimize(
         lambda trial: _optuna_objective(
             trial, X_train, y_train, X_val, y_val, groups_train,
@@ -706,7 +699,7 @@ def run_optuna(
         ),
         n_trials=remaining_trials,
         show_progress_bar=True,
-        n_jobs=4,  # 4 parallel trials × 2 threads = 8 threads on 16 cores
+        n_jobs=4,  # 4 parallel trials × 4 threads = 16 threads on 16 cores
     )
 
     best_params = study.best_params
