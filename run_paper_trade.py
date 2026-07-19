@@ -500,6 +500,11 @@ class PaperTrader:
             if kelly.bet_usd < self.config.min_bet_usd:
                 continue
 
+            # Refresh balance before placing
+            fresh_balance = self.kalshi.get_balance()
+            if fresh_balance:
+                self._bankroll = fresh_balance
+
             # PLACE PAPER TRADE
             self._total_edge_bets += 1
 
@@ -521,8 +526,8 @@ class PaperTrader:
             # Actually place order on Kalshi demo
             if not self.config.dry_run:
                 try:
-                    # Cap contracts: max $15 per bet to stay within available balance
-                    max_count = min(int(15.0 / odds["yes_ask"]), 35)
+                    # Cap contracts: max $10 per bet, max 25 contracts
+                    max_count = min(int(10.0 / odds["yes_ask"]), 25)
                     contract_count = min(max(int(kelly.bet_usd / odds["yes_ask"]), 1), max_count)
 
                     order = self.kalshi.place_order(
