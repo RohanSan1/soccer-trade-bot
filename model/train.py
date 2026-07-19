@@ -668,37 +668,59 @@ def run_optuna(
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
     )
 
-    # Resume from checkpoint if available
-    completed_trials = 0
+    # Extend from previous best params if available
     if resume:
-        trials_csv = CHECKPOINT_DIR / "optuna_trials.csv"
-        if trials_csv.exists():
-            prev_trials = pd.read_csv(str(trials_csv))
-            completed_trials = len(prev_trials)
-            logger.info("Resuming from checkpoint: %d completed trials", completed_trials)
+        best_params_path = CHECKPOINT_DIR / "optuna_best_params.json"
+        if best_params_path.exists():
+            best_data = json.loads(best_params_path.read_text())
+            prev_best = best_data.get("best_params", {})
+            prev_score = best_data.get("best_score", float("inf"))
+            logger.info("Extending from previous best: log_loss=%.4f", prev_score)
 
-            # Load best params from checkpoint
-            best_params_path = CHECKPOINT_DIR / "optuna_best_params.json"
-            if best_params_path.exists():
-                best_data = json.loads(best_params_path.read_text())
-                # Add each completed trial as a frozen trial
-                for _, row in prev_trials.iterrows():
-                    trial_params = {}
-                    for key in ["xgb_depth", "xgb_lr", "lgb_num_leaves", "lgb_lr"]:
-                        if key in row:
-                            trial_params[key] = row[key]
-                    # We only have partial params, so we can't fully replay
-                    # Instead, just skip already-completed trials count
-                logger.info("Will run %d new trials (skipping %d)", n_trials - completed_trials, completed_trials)
+            # Register previous best as a completed trial so TPE sampler seeds from it
+            def _to_optuna_params(prev: Dict) -> Dict:
+                """Map checkpoint param names to Optuna trial param names."""
+                mapping = {
+                    "xgb_max_depth": "xgb_max_depth",
+                    "xgb_lr": "xgb_lr",
+                    "xgb_n_est": "xgb_n_est",
+                    "xgb_subsample": "xgb_subsample",
+                    "xgb_colsample": "xgb_colsample",
+                    "xgb_min_child": "xgb_min_child",
+                    "xgb_reg_alpha": "xgb_reg_alpha",
+                    "xgb_reg_lambda": "xgb_reg_lambda",
+                    "lgb_num_leaves": "lgb_num_leaves",
+                    "lgb_max_depth": "lgb_max_depth",
+                    "lgb_lr": "lgb_lr",
+                    "lgb_n_est": "lgb_n_est",
+                    "lgb_subsample": "lgb_subsample",
+                    "lgb_colsample": "lgb_colsample",
+                    "lgb_min_child": "lgb_min_child",
+                    "lgb_reg_alpha": "lgb_reg_alpha",
+                    "lgb_reg_lambda": "lgb_reg_lambda",
+                    "cb_depth": "cb_depth",
+                    "cb_lr": "cb_lr",
+                    "cb_iter": "cb_iter",
+                    "cb_l2": "cb_l2",
+                }
+                return {mapping[k]: v for k, v in prev.items() if k in mapping}
 
-    remaining_trials = max(1, n_trials - completed_trials)
+            optuna_params = _to_optuna_params(prev_best)
+            study.add_trial(
+                optuna.create_trial(
+                    params=optuna_params,
+                    values=[prev_score],
+                    state=optuna.trial.TrialState.COMPLETE,
+                )
+            )
+            logger.info("Seeded study with previous best trial. Running %d new trials.", n_trials)
 
     study.optimize(
         lambda trial: _optuna_objective(
             trial, X_train, y_train, X_val, y_val, groups_train,
             checkpoint_trials, checkpoint_timer, use_catboost,
         ),
-        n_trials=remaining_trials,
+        n_trials=n_trials,
         show_progress_bar=True,
         n_jobs=4,  # 4 parallel trials × 4 threads = 16 threads on 16 cores
     )
@@ -777,7 +799,7 @@ def train(
         best_params, best_score = run_optuna(
             X_train, y_train, X_val, y_val, groups_train,
             n_trials=optuna_trials, use_catboost=use_catboost,
-            resume=resume,
+            resume=resume,  # True = extend from previous best params
         )
 
         # Extract per-model params from Optuna results
