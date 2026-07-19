@@ -184,6 +184,10 @@ class PaperTrader:
                     self._poll_match_state()
                     last_api_poll = now
 
+                    # Check for edge right after fresh data
+                    if self.predictor and self._last_prediction:
+                        self._check_edges()
+
                 # Scan Kalshi for new events
                 if now - last_kalshi_scan >= self._scan_interval:
                     self._scan_events()
@@ -191,10 +195,6 @@ class PaperTrader:
 
                 # Update prices
                 self._update_prices()
-
-                # Check for edge and place paper trades
-                if self.predictor and not self._market_only:
-                    self._check_edges()
 
                 # Status every 60 cycles (~60s)
                 self._cycle_count += 1
@@ -456,6 +456,10 @@ class PaperTrader:
             if not odds or odds["yes_ask"] <= 0:
                 continue
 
+            # Cooldown: don't re-bet same market if we already traded it at same price
+            if market.trades_count > 0 and market.last_trade_price == odds["yes_ask"]:
+                continue
+
             # Calculate edge
             market_prob = odds["yes_mid"] if odds["yes_mid"] > 0 else odds["yes_ask"]
             edge = model_prob - market_prob
@@ -510,9 +514,12 @@ class PaperTrader:
                         side="bid",
                     )
                     if order:
-                        trade_record["order_id"] = order.get("order_id", "")
+                        trade_record["order_id"] = str(order)
                         trade_record["status"] = "placed"
                         self._total_trades += 1
+                        market.trades_count += 1
+                        market.last_trade_side = "yes"
+                        market.last_trade_price = odds["yes_ask"]
                     else:
                         trade_record["status"] = "failed"
                 except Exception as e:
