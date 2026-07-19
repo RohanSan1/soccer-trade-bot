@@ -1,7 +1,7 @@
 """Paper trading runner for Kalshi demo with live match data.
 
 Two modes:
-1. Live mode: Polls API-Football for match state + Kalshi for odds. Full edge detection.
+1. Live mode: Polls KickoffAPI for match state + Kalshi for odds. Full edge detection.
 2. Market-only mode: Polls Kalshi for odds, logs signals (no model predictions).
 
 Usage:
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -27,7 +28,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import load_config, Config
-from market.api_football_client import ApiFootballClient, LiveMatchState
+from market.kickoff_api_client import KickoffApiClient, LiveMatchState as KickoffMatchState
 from market.kalshi_client import KalshiClient, KalshiMarket
 from model.predict import WinPredictor
 from trading.edge_calculator import EdgeCalculator
@@ -73,7 +74,7 @@ class PaperTrader:
         self._market_only = market_only
 
         # Components
-        self.api_football: Optional[ApiFootballClient] = None
+        self.kickoff: Optional[KickoffApiClient] = None
         self.kalshi: Optional[KalshiClient] = None
         self.predictor: Optional[WinPredictor] = None
         self.edge_calculator: Optional[EdgeCalculator] = None
@@ -87,9 +88,9 @@ class PaperTrader:
         self._total_trades: int = 0
         self._total_edge_bets: int = 0
         self._scan_interval: int = 30  # Kalshi event scan
-        self._poll_interval: int = 30  # API-Football poll
-        self._match_state: Optional[LiveMatchState] = None
-        self._prev_match_state: Optional[LiveMatchState] = None
+        self._poll_interval: int = 60  # KickoffAPI poll (60s to conserve requests)
+        self._match_state: Optional[KickoffMatchState] = None
+        self._prev_match_state: Optional[KickoffMatchState] = None
         self._game_state: Optional[GameState] = None
         self._last_prediction: Optional[Dict] = None
 
@@ -104,19 +105,27 @@ class PaperTrader:
         """Initialize all components. Returns True if ready."""
         logger.info("=" * 60)
         logger.info("PAPER TRADER INITIALIZING")
-        logger.info("Mode: %s", "MARKET-ONLY" if self._market_only else "LIVE (API-Football)")
+        logger.info("Mode: %s", "MARKET-ONLY" if self._market_only else "LIVE (KickoffAPI)")
         logger.info("Bankroll: $%.2f", self._bankroll)
         logger.info("=" * 60)
 
         SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-        # API-Football
+        # KickoffAPI client
         if not self._market_only:
-            if not self.config.api_football_key:
-                logger.error("API_FOOTBALL_KEY not set")
+            keys = []
+            # Collect all KickoffAPI keys from env
+            key1 = os.environ.get("KICKOFF_API_KEY", "")
+            key2 = os.environ.get("KICKOFF_API_KEY_2", "")
+            if key1:
+                keys.append(key1)
+            if key2:
+                keys.append(key2)
+            if not keys:
+                logger.error("KICKOFF_API_KEY not set")
                 return False
-            self.api_football = ApiFootballClient(api_key=self.config.api_football_key)
-            logger.info("API-Football client initialized")
+            self.kickoff = KickoffApiClient(keys=keys)
+            logger.info("KickoffAPI client initialized with %d keys", len(keys))
 
         # Kalshi client
         if not self.config.kalshi_api_key:
@@ -242,27 +251,16 @@ class PaperTrader:
             logger.warning("No WC Final markets found — will retry in scan")
 
     def _poll_match_state(self) -> None:
-        """Poll API-Football for live match state."""
-        fixture_id = self.config.api_football_fixture_id
+        """Poll KickoffAPI for live match state."""
+        fixture_id = int(os.environ.get("KICKOFF_FIXTURE_ID", "1591866"))
         if not fixture_id:
-            # Auto-discover: search for Spain vs Argentina
-            if self.api_football:
-                fixture_id = self.api_football.search_world_cup_match(
-                    home_team="Spain", away_team="Argentina"
-                )
-                if not fixture_id:
-                    fixture_id = self.api_football.search_world_cup_match(home_team="Argentina")
-                if fixture_id:
-                    logger.info("Found WC Final fixture ID: %d", fixture_id)
-                else:
-                    logger.debug("WC Final not found yet (match may not have started)")
-                    return
+            return
 
-        if not self.api_football:
+        if not self.kickoff:
             return
 
         self._prev_match_state = self._match_state
-        self._match_state = self.api_football.get_live_match(fixture_id)
+        self._match_state = self.kickoff.get_live_match(fixture_id)
 
         if not self._match_state:
             return
@@ -274,7 +272,7 @@ class PaperTrader:
             "LIVE: %s %d - %d %s | %s %s' | events=%d | API calls=%d",
             ms.home_team, ms.home_score, ms.away_score, ms.away_team,
             ms.status, ms.clock_minutes,
-            len(ms.events), self.api_football.request_count,
+            len(ms.events), self.kickoff.request_count,
         )
 
         # Convert to GameState for prediction
@@ -303,8 +301,8 @@ class PaperTrader:
         # Update state file
         self._write_state()
 
-    def _match_state_to_game_state(self, ms: LiveMatchState) -> GameState:
-        """Convert API-Football LiveMatchState to GameState for model prediction."""
+    def _match_state_to_game_state(self, ms: KickoffMatchState) -> GameState:
+        """Convert KickoffAPI LiveMatchState to GameState for model prediction."""
         # Determine if home team is actually home (in WC Final, it's neutral)
         is_neutral = True  # World Cup Final is always neutral venue
 
@@ -356,7 +354,7 @@ class PaperTrader:
             days_since_last_match_away=7,
         )
 
-    def _count_goals_in_window(self, ms: LiveMatchState, window_minutes: int) -> int:
+    def _count_goals_in_window(self, ms: KickoffMatchState, window_minutes: int) -> int:
         """Count goals scored in last N minutes from events."""
         count = 0
         for event in ms.events:
@@ -364,7 +362,7 @@ class PaperTrader:
                 count += 1
         return count
 
-    def _count_cards_in_window(self, ms: LiveMatchState, window_minutes: int) -> int:
+    def _count_cards_in_window(self, ms: KickoffMatchState, window_minutes: int) -> int:
         """Count cards shown in last N minutes from events."""
         count = 0
         for event in ms.events:
@@ -372,7 +370,7 @@ class PaperTrader:
                 count += 1
         return count
 
-    def _compute_momentum(self, ms: LiveMatchState) -> float:
+    def _compute_momentum(self, ms: KickoffMatchState) -> float:
         """Compute momentum shift from recent events."""
         if not self._prev_match_state:
             return 0.0
@@ -577,7 +575,7 @@ class PaperTrader:
                 "clock": ms.clock_minutes,
                 "status": ms.status,
                 "events": len(ms.events),
-                "api_calls": self.api_football.request_count if self.api_football else 0,
+                "api_calls": self.kickoff.request_count if self.kickoff else 0,
             }
 
         state = {
