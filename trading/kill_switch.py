@@ -52,12 +52,14 @@ class KillSwitch:
         self,
         stream_lag_max: int = 8,
         ocr_fail_threshold: int = 5,
+        ocr_confidence_threshold: float = 0.70,
         api_error_threshold: int = 3,
         api_error_window: int = 60,
         drawdown_threshold: float = 0.20,
     ) -> None:
         self.stream_lag_max = stream_lag_max
         self.ocr_fail_threshold = ocr_fail_threshold
+        self.ocr_confidence_threshold = ocr_confidence_threshold
         self.api_error_threshold = api_error_threshold
         self.api_error_window = api_error_window
         self.drawdown_threshold = drawdown_threshold
@@ -112,15 +114,15 @@ class KillSwitch:
 
     def check_ocr_confidence(self, confidence: float) -> bool:
         """Check consecutive OCR failures."""
-        if confidence < 0.70:
+        if confidence < self.ocr_confidence_threshold:
             self.state.consecutive_ocr_fails += 1
         else:
             self.state.consecutive_ocr_fails = 0
 
         if self.state.consecutive_ocr_fails >= self.ocr_fail_threshold:
             self._halt(
-                f"OCR confidence < 0.70 for {self.state.consecutive_ocr_fails} "
-                f"consecutive reads"
+                f"OCR confidence < {self.ocr_confidence_threshold} for "
+                f"{self.state.consecutive_ocr_fails} consecutive reads"
             )
             return True
         return False

@@ -45,10 +45,12 @@ class EdgeCalculator:
 
     Args:
         edge_threshold: Minimum edge to consider tradable (default 5%).
+        confidence_threshold: Minimum model probability to consider an outcome (default 0.70).
     """
 
-    def __init__(self, edge_threshold: float = 0.05) -> None:
+    def __init__(self, edge_threshold: float = 0.05, confidence_threshold: float = 0.70) -> None:
         self.edge_threshold = edge_threshold
+        self.confidence_threshold = confidence_threshold
 
     def calculate(
         self,
@@ -102,7 +104,7 @@ class EdgeCalculator:
 
             # Edge = model probability - execution price (what you'd pay)
             edge = model_p - execution_price
-            has_edge = edge >= self.edge_threshold
+            has_edge = edge >= self.edge_threshold and model_p >= self.confidence_threshold
 
             edges[outcome] = EdgeResult(
                 outcome=outcome,

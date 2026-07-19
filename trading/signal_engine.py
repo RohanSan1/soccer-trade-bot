@@ -71,6 +71,7 @@ class SignalEngine:
         trade_logger: TradeLogger,
         dry_run: bool = True,
         bankroll: float = 1000.0,
+        final_minutes_skip: int = 5,
     ) -> None:
         self.predictor = predictor
         self.market_selector = market_selector
@@ -82,6 +83,7 @@ class SignalEngine:
         self.dry_run = dry_run
         self.bankroll = bankroll
         self._cycle_count = 0
+        self._final_minutes_skip = final_minutes_skip
 
     def run_cycle(self, state: GameState) -> SignalResult:
         """Execute one trading cycle.
@@ -124,10 +126,11 @@ class SignalEngine:
             # 3. Dynamic clock cutoff — best edge in 75-85 window when markets lag
             clock = state.clock_minutes
             score_diff = abs(state.score_diff)
-            if clock > 85:
-                logger.debug("Clock > 85 min, skipping")
+            skip_after = 90 - self._final_minutes_skip
+            if clock > skip_after:
+                logger.debug("Clock > %d min, skipping", skip_after)
                 return result
-            elif clock > 80 and score_diff == 0:
+            elif clock > (skip_after - 5) and score_diff == 0:
                 # Draw game late: still have edge as market lags
                 pass
             elif clock > 78 and score_diff >= 2:

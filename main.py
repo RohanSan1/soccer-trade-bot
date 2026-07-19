@@ -121,15 +121,17 @@ class SoccerTradeBot:
         # Trading logic
         self.edge_calculator = EdgeCalculator(
             edge_threshold=self.config.edge_threshold,
+            confidence_threshold=self.config.confidence_threshold,
         )
         self.kelly_sizer = KellySizer(
-            kelly_fraction=self.config.kelly_fraction,
+            base_kelly=self.config.kelly_fraction,
             max_bet_pct=self.config.max_bet_pct,
             min_bet_usd=self.config.min_bet_usd,
         )
         self.kill_switch = KillSwitch(
             stream_lag_max=self.config.stream_lag_max_seconds,
             ocr_fail_threshold=self.config.ocr_fail_threshold,
+            ocr_confidence_threshold=self.config.ocr_confidence_threshold,
             api_error_threshold=self.config.api_error_threshold,
             api_error_window=self.config.api_error_window_seconds,
             drawdown_threshold=self.config.drawdown_threshold_pct,
@@ -144,6 +146,7 @@ class SoccerTradeBot:
             trade_logger=self.trade_logger,
             dry_run=self.config.dry_run,
             bankroll=1000.0,
+            final_minutes_skip=self.config.final_minutes_skip,
         )
 
         logger.info("All components initialized")
