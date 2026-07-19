@@ -88,6 +88,11 @@ class KickoffApiClient:
         self._last_request_time = 0.0
         self._session = requests.Session()
         self._remaining_per_key: Dict[str, int] = {k: 100 for k in keys}
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
     @property
     def _api_key(self) -> str:
@@ -103,7 +108,7 @@ class KickoffApiClient:
             return True
         return False
 
-    def _get(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
+    def _get(self, endpoint: str, params: Dict = None, retries: int = 2) -> Optional[Dict]:
         """Make an API request with rate limiting and key rotation."""
         # Rate limit: max 10 req/min to be safe
         elapsed = time.time() - self._last_request_time
@@ -115,36 +120,45 @@ class KickoffApiClient:
             params = {}
 
         for attempt in range(len(self.keys)):
-            try:
-                resp = self._session.get(
-                    url,
-                    params=params,
-                    headers={"x-api-key": self._api_key},
-                    timeout=15,
-                )
-                self._last_request_time = time.time()
-                self._request_count += 1
+            for retry in range(retries):
+                try:
+                    resp = self._session.get(
+                        url,
+                        params=params,
+                        headers={
+                            "x-api-key": self._api_key,
+                            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                        },
+                        timeout=15,
+                    )
+                    self._last_request_time = time.time()
+                    self._request_count += 1
 
-                # Track remaining
-                remaining = resp.headers.get("X-RateLimit-Remaining")
-                if remaining is not None:
-                    self._remaining_per_key[self._api_key] = int(remaining)
+                    # Track remaining
+                    remaining = resp.headers.get("X-RateLimit-Remaining")
+                    if remaining is not None:
+                        self._remaining_per_key[self._api_key] = int(remaining)
 
-                if resp.status_code == 200:
-                    return resp.json()
-                elif resp.status_code == 429:
-                    logger.warning("KickoffAPI rate limited on key %d, rotating...",
-                                  self._current_key_idx + 1)
-                    if not self._rotate_key():
-                        logger.error("All API keys exhausted!")
+                    if resp.status_code == 200:
+                        return resp.json()
+                    elif resp.status_code == 429:
+                        logger.warning("KickoffAPI rate limited on key %d, rotating...",
+                                      self._current_key_idx + 1)
+                        if not self._rotate_key():
+                            logger.error("All API keys exhausted!")
+                            return None
+                        break
+                    elif resp.status_code == 403:
+                        logger.warning("KickoffAPI 403 (Cloudflare?) on key %d, retry %d/%d...",
+                                      self._current_key_idx + 1, retry + 1, retries)
+                        time.sleep(3)
+                        continue
+                    else:
+                        logger.error("KickoffAPI %d: %s", resp.status_code, resp.text[:200])
                         return None
-                    continue
-                else:
-                    logger.error("KickoffAPI %d: %s", resp.status_code, resp.text[:200])
+                except requests.RequestException as e:
+                    logger.error("KickoffAPI request failed: %s", e)
                     return None
-            except requests.RequestException as e:
-                logger.error("KickoffAPI request failed: %s", e)
-                return None
 
         logger.error("All API keys exhausted")
         return None
