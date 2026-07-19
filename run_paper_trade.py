@@ -183,11 +183,11 @@ class PaperTrader:
         self._shutdown()
 
     def _scan_events(self) -> None:
-        """Scan Kalshi for open soccer events."""
+        """Scan Kalshi for open soccer events (match markets + tournament futures)."""
         logger.debug("Scanning Kalshi for soccer events...")
 
-        # Try different series
-        for series in ["KXSOCCER", "KXMLBSOCCER", "KXMLB", "KXPREMIERLEAGUE"]:
+        # Individual match markets (KXWCGAME) + tournament futures
+        for series in ["KXWCGAME", "KXMENWORLDCUP", "KXSOCCER", "KXMLBSOCCER"]:
             events = self.kalshi.get_game_events("soccer")
 
             for event in events:
@@ -199,10 +199,12 @@ class PaperTrader:
                 if not markets:
                     continue
 
-                # Filter to match-winner markets (home/draw/away or home/away)
                 for m in markets:
                     if m.ticker not in self._active_markets:
-                        # New market found
+                        # Only track active markets (not finalized)
+                        if m.status != "active":
+                            continue
+
                         self._active_markets[m.ticker] = ActiveMarket(
                             ticker=m.ticker,
                             event_ticker=event_ticker,

@@ -35,7 +35,7 @@ KALSHI_PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 
 # Known series tickers for soccer
-SOCCER_SERIES = ["KXSOCCER", "KXMLBSOCCER", "KXMLS", "KXPREMIERLEAGUE"]
+SOCCER_SERIES = ["KXWCGAME", "KXMENWORLDCUP", "KXSOCCER", "KXMLBSOCCER", "KXMLS", "KXPREMIERLEAGUE"]
 
 
 @dataclass
@@ -430,21 +430,21 @@ class KalshiClient:
         self,
         ticker: str,
         side: str,
-        yes_price: int,
+        yes_price,
         count: int,
     ) -> Optional[str]:
         """Place a limit order on Kalshi demo.
 
         - side="bid" → buy YES (you think home team wins)
         - side="ask" → buy NO (you think away team wins)
-        - price is sent as 4-decimal dollar string e.g. "0.5600"
+        - yes_price: cents (int 1-99) or dollar string ("0.4300")
         - Endpoint: POST /portfolio/orders
         - Order type: good_till_canceled limit order
 
         Args:
             ticker: Market ticker.
             side: 'bid' or 'ask'.
-            yes_price: Price in cents (1-99).
+            yes_price: Price in cents (int) or dollar string (e.g., "0.4300").
             count: Number of contracts.
 
         Returns:
@@ -452,32 +452,41 @@ class KalshiClient:
         """
         if self.dry_run:
             logger.info(
-                "[DRY RUN] Kalshi order: %s %s @ %d cents x %d",
+                "[DRY RUN] Kalshi order: %s %s @ %s x %d",
                 side, ticker, yes_price, count,
             )
             return f"dry_run_{int(time.time())}"
 
-        # Convert cents to dollar string: 56 → "0.5600"
-        price_str = f"{yes_price / 100:.4f}"
+        # Normalize price to dollar string
+        if isinstance(yes_price, str):
+            price_str = yes_price  # Already "0.4300" format
+        else:
+            price_str = f"{yes_price / 100:.4f}"  # Cents → dollars
 
+        # V2 endpoint: POST /portfolio/events/orders
         order_data = {
             "ticker": ticker,
-            "action": side.lower(),
-            "type": "limit",
-            "yes_price": price_str,
-            "count": count,
-            "time_in_force": "gtc",
+            "side": side.lower(),  # "bid" or "ask"
+            "count": f"{count:.2f}",  # Fixed-point string
+            "price": price_str,
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
 
         resp = self._request(
             "POST",
-            "/portfolio/orders",
+            "/portfolio/events/orders",
             json_data=order_data,
             base_url=self._trade_url,
         )
-        if resp and "order" in resp:
-            order_id = resp["order"].get("order_id", "")
-            logger.info("Kalshi order placed: %s", order_id)
+        if resp and "order_id" in resp:
+            order_id = resp["order_id"]
+            fill_count = resp.get("fill_count", "0.00")
+            remaining = resp.get("remaining_count", f"{count:.2f}")
+            logger.info(
+                "Kalshi order placed: %s | filled=%s remaining=%s",
+                order_id, fill_count, remaining,
+            )
             return order_id
 
         return None
