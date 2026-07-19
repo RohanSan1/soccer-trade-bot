@@ -526,8 +526,9 @@ class PaperTrader:
             # Actually place order on Kalshi demo
             if not self.config.dry_run:
                 try:
-                    # Cap contracts: max $10 per bet, max 25 contracts
-                    max_count = min(int(10.0 / odds["yes_ask"]), 25)
+                    # Cap contracts: max $3 per bet to fit available balance
+                    # (resting orders from earlier consume margin)
+                    max_count = min(int(3.0 / odds["yes_ask"]), 8)
                     contract_count = min(max(int(kelly.bet_usd / odds["yes_ask"]), 1), max_count)
 
                     order = self.kalshi.place_order(
