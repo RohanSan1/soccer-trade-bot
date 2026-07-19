@@ -47,7 +47,7 @@ class Config:
 
     # --- Trading parameters ---
     min_bet_usd: float = 5.0
-    max_bet_pct: float = 0.02
+    max_bet_pct: float = 0.05
     kelly_fraction: float = 0.25
     edge_threshold: float = 0.05
     confidence_threshold: float = 0.70

@@ -650,14 +650,12 @@ class PaperTrader:
             # Actually place order on Kalshi demo
             if not self.config.dry_run:
                 try:
-                    # Cap: max $3 per bet (resting orders from earlier consume margin)
-                    max_count = min(int(3.0 / odds["yes_ask"]), 8)
-                    contract_count = min(max(int(kelly.bet_usd / odds["yes_ask"]), 1), max_count)
+                    contract_count = max(int(kelly.bet_usd / odds["yes_ask"]), 1)
 
-                    # Check we have enough balance
-                    cost = contract_count * odds["yes_ask"]
-                    if cost > self._bankroll * 0.10:  # never bet more than 10% of bankroll
-                        contract_count = max(int(self._bankroll * 0.10 / odds["yes_ask"]), 1)
+                    # Safety: never bet more than 20% of bankroll on a single market
+                    max_cost = self._bankroll * 0.20
+                    if contract_count * odds["yes_ask"] > max_cost:
+                        contract_count = max(int(max_cost / odds["yes_ask"]), 1)
 
                     order = self.kalshi.place_order(
                         ticker=ticker,
