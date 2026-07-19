@@ -417,9 +417,10 @@ class SoccerEnsemble:
             raise ValueError("No models in ensemble")
 
         if self._use_stacking and self._stack_meta is not None:
-            # Use stacking meta-learner
-            base_probs = np.column_stack([p for p, _ in probs_list])
-            ensemble_probs = self._stack_meta.predict_proba(base_probs)
+            # Use stacking meta-learner (meta was trained on averaged probs)
+            total_weight = sum(w for _, w in probs_list)
+            avg_probs = sum(p * w for p, w in probs_list) / total_weight
+            ensemble_probs = self._stack_meta.predict_proba(avg_probs)
         else:
             # Weighted average
             total_weight = sum(w for _, w in probs_list)
