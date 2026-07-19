@@ -113,16 +113,19 @@ class KalshiClient:
             except Exception as e:
                 logger.error("Failed to load Kalshi private key: %s", e)
 
-    def _sign_request(self, method: str, path: str) -> Dict[str, str]:
+    def _sign_request(self, method: str, path: str, base_url: Optional[str] = None) -> Dict[str, str]:
         """Generate RSA-PSS signed headers.
 
-        Signs: timestamp + method + path (without query params).
+        Signs: timestamp + method + full_path (including /trade-api/v2 prefix).
+        Kalshi requires the full API path in the signature, not just the relative path.
         """
         if not self._private_key or not self.api_key:
             return {}
 
         timestamp = str(int(datetime.datetime.now().timestamp() * 1000))
-        sign_path = urlparse(path).path
+        # Build full URL path for signing: base_url + path
+        full_url = f"{base_url or self._price_url}{path}"
+        sign_path = urlparse(full_url).path  # e.g., /trade-api/v2/portfolio/balance
         message = f"{timestamp}{method}{sign_path}".encode()
 
         signature = self._private_key.sign(
@@ -162,7 +165,7 @@ class KalshiClient:
             Response JSON or None on error.
         """
         url = f"{base_url or self._price_url}{path}"
-        headers = self._sign_request(method, path)
+        headers = self._sign_request(method, path, base_url=base_url)
 
         try:
             resp = self._session.request(
