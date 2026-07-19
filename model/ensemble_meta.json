@@ -1,7 +1,7 @@
 {
-  "xgb_weight": 0.1,
-  "lgbm_weight": 0.1,
-  "cb_weight": 0.8,
+  "xgb_weight": 1.0,
+  "lgbm_weight": 0.0,
+  "cb_weight": 0.0,
   "feature_names": [
     "score_diff",
     "clock_minutes",
@@ -61,5 +61,5 @@
     "draw",
     "away"
   ],
-  "use_stacking": false
+  "use_stacking": true
 }
