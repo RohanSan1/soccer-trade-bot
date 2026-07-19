@@ -365,13 +365,19 @@ class KalshiClient:
             if not resp:
                 return None
 
-            orderbook = resp.get("orderbook", {})
-            yes_book = orderbook.get("yes", [])
-            no_book = orderbook.get("no", [])
+            # Try both API response formats
+            orderbook = resp.get("orderbook_fp") or resp.get("orderbook", {})
+            yes_book = orderbook.get("yes_dollars") or orderbook.get("yes", [])
+            no_book = orderbook.get("no_dollars") or orderbook.get("no", [])
 
-            # Yes side: bids are buy orders, asks are sell orders
-            yes_bid = float(yes_book[0].get("price", 0)) / 100 if yes_book else 0.0
-            yes_ask = float(yes_book[-1].get("price", 100)) / 100 if yes_book else 1.0
+            if not yes_book and not no_book:
+                return None
+
+            # Best YES bid: highest price in yes_dollars (sorted ascending by price)
+            yes_bid = float(yes_book[-1][0]) if yes_book else 0.0
+            # Best YES ask: 1 - highest NO bid (buying NO = selling YES)
+            no_bid = float(no_book[-1][0]) if no_book else 0.0
+            yes_ask = 1.0 - no_bid if no_bid > 0 else 1.0
 
             return KalshiOrderbook(
                 ticker=ticker,
