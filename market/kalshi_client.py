@@ -4,6 +4,13 @@ Handles:
 - Market discovery for soccer match winner markets
 - RSA-PSS signed request authentication
 - Order placement and management
+- Dual-mode: production API for prices (real liquidity), demo API for orders
+
+Flow:
+1. GET /events → find soccer game events
+2. GET /markets?event_ticker=... → get markets inside that event
+3. Read yes_ask_dollars → convert to cents for pricing
+4. POST /portfolio/orders → place limit orders on demo
 """
 from __future__ import annotations
 
@@ -22,8 +29,13 @@ from cryptography.hazmat.primitives.asymmetric import padding, utils
 
 logger = logging.getLogger(__name__)
 
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+# Production: real liquidity, real bid/ask spreads
+KALSHI_PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+# Demo: paper trading only
 KALSHI_DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
+
+# Known series tickers for soccer
+SOCCER_SERIES = ["KXSOCCER", "KXMLBSOCCER", "KXMLS", "KXPREMIERLEAGUE"]
 
 
 @dataclass
@@ -33,6 +45,7 @@ class KalshiMarket:
     ticker: str
     title: str
     subtitle: str
+    event_ticker: str
     yes_bid: float
     yes_ask: float
     no_bid: float
@@ -40,7 +53,7 @@ class KalshiMarket:
     volume: int
     open_interest: int
     status: str
-   expiration_time: str
+    expiration_time: str
 
 
 @dataclass
@@ -59,11 +72,15 @@ class KalshiOrderbook:
 class KalshiClient:
     """Kalshi REST API client with RSA-PSS authentication.
 
+    Dual-mode architecture:
+    - Price fetching always hits production (real liquidity)
+    - Order placement hits demo (paper trading)
+
     Args:
-        api_key: Kalshi API key ID.
+        api_key: Kalshi API key ID (e.g., 'dc990621...').
         private_key_pem: RSA private key in PEM format.
         dry_run: If True, log orders without placing them.
-        use_demo: If True, use demo environment.
+        use_demo: If True, place orders on demo (default True).
     """
 
     def __init__(
@@ -71,14 +88,20 @@ class KalshiClient:
         api_key: str = "",
         private_key_pem: str = "",
         dry_run: bool = True,
-        use_demo: bool = False,
+        use_demo: bool = True,
     ) -> None:
         self.api_key = api_key
         self.private_key_pem = private_key_pem
         self.dry_run = dry_run
-        self.base_url = KALSHI_DEMO_BASE if use_demo else KALSHI_API_BASE
+        self.use_demo = use_demo
+
+        # Dual URLs: prices from prod, orders from demo
+        self._price_url = KALSHI_PROD_BASE
+        self._trade_url = KALSHI_DEMO_BASE if use_demo else KALSHI_PROD_BASE
+
         self._private_key = None
         self._session = requests.Session()
+        self._market_cache: Dict[str, KalshiMarket] = {}
 
         if private_key_pem:
             try:
@@ -86,25 +109,19 @@ class KalshiClient:
                     private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem,
                     password=None,
                 )
+                logger.info("Kalshi RSA key loaded")
             except Exception as e:
-                logger.error("Failed to load private key: %s", e)
+                logger.error("Failed to load Kalshi private key: %s", e)
 
     def _sign_request(self, method: str, path: str) -> Dict[str, str]:
-        """Generate RSA-PSS signed headers for authenticated requests.
+        """Generate RSA-PSS signed headers.
 
-        Args:
-            method: HTTP method (GET, POST, etc.).
-            path: API path (e.g., /trade-api/v2/portfolio/orders).
-
-        Returns:
-            Dictionary of authentication headers.
+        Signs: timestamp + method + path (without query params).
         """
         if not self._private_key or not self.api_key:
             return {}
 
         timestamp = str(int(datetime.datetime.now().timestamp() * 1000))
-
-        # Sign: timestamp + method + path (without query params)
         sign_path = urlparse(path).path
         message = f"{timestamp}{method}{sign_path}".encode()
 
@@ -130,6 +147,7 @@ class KalshiClient:
         path: str,
         params: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
+        base_url: Optional[str] = None,
     ) -> Optional[Dict]:
         """Make authenticated request to Kalshi API.
 
@@ -138,11 +156,12 @@ class KalshiClient:
             path: API path.
             params: Query parameters.
             json_data: JSON body for POST/PUT.
+            base_url: Override base URL (default: self._price_url).
 
         Returns:
             Response JSON or None on error.
         """
-        url = f"{self.base_url}{path}"
+        url = f"{base_url or self._price_url}{path}"
         headers = self._sign_request(method, path)
 
         try:
@@ -164,10 +183,75 @@ class KalshiClient:
             logger.error("Kalshi request failed: %s", e)
             return None
 
+    # ── Event-based market discovery ──────────────────────────────
+
+    def get_game_events(self, sport: str = "soccer") -> List[Dict]:
+        """Fetch all open game events for a sport.
+
+        Uses Kalshi's dedicated series (e.g., KXSOCCER for soccer).
+        Each event represents a match with multiple markets inside.
+
+        Args:
+            sport: Sport to search ('soccer').
+
+        Returns:
+            List of event dicts with event_ticker, title, etc.
+        """
+        events = []
+        series_tickers = SOCCER_SERIES if sport == "soccer" else [f"KX{sport.upper()}"]
+
+        for series in series_tickers:
+            try:
+                resp = self._request(
+                    "GET",
+                    "/events",
+                    params={"series_ticker": series, "limit": 100, "status": "open"},
+                )
+                if resp and "events" in resp:
+                    events.extend(resp["events"])
+                    logger.info("Found %d events in series %s", len(resp["events"]), series)
+            except Exception as e:
+                logger.warning("Failed to fetch events for %s: %s", series, e)
+
+        return events
+
+    def get_event_markets(self, event_ticker: str) -> List[KalshiMarket]:
+        """Fetch all markets inside an event (e.g., a specific match).
+
+        Args:
+            event_ticker: Event ticker (e.g., 'KXSOCCER-GAME-123').
+
+        Returns:
+            List of KalshiMarket objects.
+        """
+        markets = []
+
+        try:
+            resp = self._request(
+                "GET",
+                "/markets",
+                params={"event_ticker": event_ticker, "limit": 100, "status": "open"},
+            )
+            if not resp or "markets" not in resp:
+                return markets
+
+            for item in resp["markets"]:
+                market = self._parse_market(item)
+                if market:
+                    markets.append(market)
+                    self._market_cache[market.ticker] = market
+
+        except Exception as e:
+            logger.error("Failed to fetch markets for %s: %s", event_ticker, e)
+
+        return markets
+
     def search_soccer_markets(
         self, team_home: str, team_away: str
     ) -> List[KalshiMarket]:
-        """Search for soccer match winner markets.
+        """Search for soccer match winner markets by team names.
+
+        Flow: events → markets → filter by team names.
 
         Args:
             team_home: Home team name.
@@ -176,53 +260,93 @@ class KalshiClient:
         Returns:
             List of matching markets.
         """
-        markets = []
+        all_markets = []
 
+        # Get all soccer events
+        events = self.get_game_events("soccer")
+
+        for event in events:
+            event_ticker = event.get("event_ticker", "")
+            event_title = event.get("title", "").lower()
+
+            # Check if both teams are mentioned in event title
+            if (
+                team_home.lower() in event_title
+                and team_away.lower() in event_title
+            ):
+                # Get markets inside this event
+                markets = self.get_event_markets(event_ticker)
+                all_markets.extend(markets)
+
+        # Also search by direct market title/subtitle if event search found nothing
+        if not all_markets:
+            try:
+                resp = self._request(
+                    "GET",
+                    "/markets",
+                    params={"limit": 100, "status": "open", "series_ticker": "KXSOCCER"},
+                )
+                if resp and "markets" in resp:
+                    for item in resp["markets"]:
+                        title = item.get("title", "").lower()
+                        subtitle = item.get("subtitle", "").lower()
+                        if (
+                            team_home.lower() in title
+                            and team_away.lower() in title
+                        ) or (
+                            team_home.lower() in subtitle
+                            and team_away.lower() in subtitle
+                        ):
+                            market = self._parse_market(item)
+                            if market:
+                                all_markets.append(market)
+            except Exception as e:
+                logger.error("Failed to search Kalshi markets: %s", e)
+
+        return all_markets
+
+    def _parse_market(self, item: Dict) -> Optional[KalshiMarket]:
+        """Parse a market dict from Kalshi API into KalshiMarket.
+
+        Handles both cents (yes_bid/yes_ask as int) and
+        dollar format (yes_ask_dollars as string like "0.5600").
+        """
         try:
-            # Search for open soccer markets
-            resp = self._request(
-                "GET",
-                "/markets",
-                params={"limit": 100, "status": "open", "series_ticker": "KXSOCCER"},
+            # Handle dollar format: "0.5600" → 0.56
+            if "yes_ask_dollars" in item:
+                yes_ask = float(item["yes_ask_dollars"])
+                yes_bid = float(item.get("yes_bid_dollars", 1.0 - yes_ask))
+            elif "yes_bid" in item:
+                # Cents format: 56 → 0.56
+                yes_bid = float(item.get("yes_bid", 0)) / 100
+                yes_ask = float(item.get("yes_ask", 100)) / 100
+            else:
+                return None
+
+            return KalshiMarket(
+                ticker=item.get("ticker", ""),
+                title=item.get("title", ""),
+                subtitle=item.get("subtitle", ""),
+                event_ticker=item.get("event_ticker", ""),
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=1.0 - yes_ask,
+                no_ask=1.0 - yes_bid,
+                volume=item.get("volume", 0),
+                open_interest=item.get("open_interest", 0),
+                status=item.get("status", ""),
+                expiration_time=item.get("expiration_time", ""),
             )
+        except (ValueError, TypeError) as e:
+            logger.warning("Failed to parse market: %s", e)
+            return None
 
-            if not resp or "markets" not in resp:
-                return markets
-
-            for item in resp["markets"]:
-                title = item.get("title", "").lower()
-                subtitle = item.get("subtitle", "").lower()
-
-                # Check if both teams are mentioned
-                if (
-                    team_home.lower() in title
-                    and team_away.lower() in title
-                ) or (
-                    team_home.lower() in subtitle
-                    and team_away.lower() in subtitle
-                ):
-                    market = KalshiMarket(
-                        ticker=item.get("ticker", ""),
-                        title=item.get("title", ""),
-                        subtitle=item.get("subtitle", ""),
-                        yes_bid=float(item.get("yes_bid", 0)) / 100,
-                        yes_ask=float(item.get("yes_ask", 100)) / 100,
-                        no_bid=float(item.get("no_bid", 0)) / 100,
-                        no_ask=float(item.get("no_ask", 100)) / 100,
-                        volume=item.get("volume", 0),
-                        open_interest=item.get("open_interest", 0),
-                        status=item.get("status", ""),
-                        expiration_time=item.get("expiration_time", ""),
-                    )
-                    markets.append(market)
-
-        except Exception as e:
-            logger.error("Failed to search Kalshi: %s", e)
-
-        return markets
+    # ── Orderbook ─────────────────────────────────────────────────
 
     def get_orderbook(self, ticker: str) -> Optional[KalshiOrderbook]:
         """Get current orderbook for a market.
+
+        Always fetches from production for real liquidity.
 
         Args:
             ticker: Market ticker.
@@ -231,14 +355,20 @@ class KalshiClient:
             KalshiOrderbook or None.
         """
         try:
-            resp = self._request("GET", f"/markets/{ticker}/orderbook")
+            resp = self._request(
+                "GET", f"/markets/{ticker}/orderbook",
+                base_url=self._price_url,
+            )
             if not resp:
                 return None
 
             orderbook = resp.get("orderbook", {})
-            # Kalshi prices are in cents (1-99)
-            yes_bid = float(orderbook.get("yes", [{}])[0].get("price", 0)) / 100 if orderbook.get("yes") else 0.0
-            yes_ask = float(orderbook.get("yes", [{}])[-1].get("price", 100)) / 100 if orderbook.get("yes") else 1.0
+            yes_book = orderbook.get("yes", [])
+            no_book = orderbook.get("no", [])
+
+            # Yes side: bids are buy orders, asks are sell orders
+            yes_bid = float(yes_book[0].get("price", 0)) / 100 if yes_book else 0.0
+            yes_ask = float(yes_book[-1].get("price", 100)) / 100 if yes_book else 1.0
 
             return KalshiOrderbook(
                 ticker=ticker,
@@ -254,6 +384,39 @@ class KalshiClient:
             logger.error("Failed to get Kalshi orderbook for %s: %s", ticker, e)
             return None
 
+    def get_yes_price_cents(self, market: Dict) -> int:
+        """Extract yes ask price in cents from market dict.
+
+        Reads yes_ask_dollars (e.g., "0.5600") and converts to 56 cents.
+
+        Args:
+            market: Raw market dict from Kalshi API.
+
+        Returns:
+            Price in cents (1-99).
+        """
+        if "yes_ask_dollars" in market:
+            return int(float(market["yes_ask_dollars"]) * 100)
+        elif "yes_ask" in market:
+            return int(market["yes_ask"])
+        return 50  # fallback
+
+    def get_implied_probability(self, market: Dict) -> float:
+        """Get implied probability from market dict.
+
+        Divides yes_ask_dollars by 100 → 0.56 = 56%.
+
+        Args:
+            market: Raw market dict from Kalshi API.
+
+        Returns:
+            Implied probability (0.0-1.0).
+        """
+        cents = self.get_yes_price_cents(market)
+        return cents / 100.0
+
+    # ── Order placement (always on demo) ─────────────────────────
+
     def place_order(
         self,
         ticker: str,
@@ -261,11 +424,17 @@ class KalshiClient:
         yes_price: int,
         count: int,
     ) -> Optional[str]:
-        """Place a limit order on Kalshi.
+        """Place a limit order on Kalshi demo.
+
+        - side="bid" → buy YES (you think home team wins)
+        - side="ask" → buy NO (you think away team wins)
+        - price is sent as 4-decimal dollar string e.g. "0.5600"
+        - Endpoint: POST /portfolio/orders
+        - Order type: good_till_canceled limit order
 
         Args:
             ticker: Market ticker.
-            side: 'BUY' or 'SELL'.
+            side: 'bid' or 'ask'.
             yes_price: Price in cents (1-99).
             count: Number of contracts.
 
@@ -279,16 +448,24 @@ class KalshiClient:
             )
             return f"dry_run_{int(time.time())}"
 
+        # Convert cents to dollar string: 56 → "0.5600"
+        price_str = f"{yes_price / 100:.4f}"
+
         order_data = {
             "ticker": ticker,
             "action": side.lower(),
             "type": "limit",
-            "yes_price": yes_price,
+            "yes_price": price_str,
             "count": count,
             "time_in_force": "gtc",
         }
 
-        resp = self._request("POST", "/portfolio/orders", json_data=order_data)
+        resp = self._request(
+            "POST",
+            "/portfolio/orders",
+            json_data=order_data,
+            base_url=self._trade_url,
+        )
         if resp and "order" in resp:
             order_id = resp["order"].get("order_id", "")
             logger.info("Kalshi order placed: %s", order_id)
@@ -309,16 +486,36 @@ class KalshiClient:
             logger.info("[DRY RUN] Cancel Kalshi order: %s", order_id)
             return True
 
-        resp = self._request("DELETE", f"/portfolio/orders/{order_id}")
+        resp = self._request(
+            "DELETE", f"/portfolio/orders/{order_id}",
+            base_url=self._trade_url,
+        )
         return resp is not None
 
     def get_balance(self) -> Optional[float]:
-        """Get current account balance.
+        """Get current demo account balance.
 
         Returns:
             Balance in dollars, or None on error.
         """
-        resp = self._request("GET", "/portfolio/balance")
+        resp = self._request(
+            "GET", "/portfolio/balance",
+            base_url=self._trade_url,
+        )
         if resp:
             return float(resp.get("balance", 0)) / 100
         return None
+
+    def get_positions(self) -> List[Dict]:
+        """Get current open positions.
+
+        Returns:
+            List of position dicts.
+        """
+        resp = self._request(
+            "GET", "/portfolio/positions",
+            base_url=self._trade_url,
+        )
+        if resp:
+            return resp.get("market_positions", [])
+        return []
