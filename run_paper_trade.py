@@ -521,10 +521,14 @@ class PaperTrader:
             # Actually place order on Kalshi demo
             if not self.config.dry_run:
                 try:
+                    # Cap contracts: max $15 per bet to stay within available balance
+                    max_count = min(int(15.0 / odds["yes_ask"]), 35)
+                    contract_count = min(max(int(kelly.bet_usd / odds["yes_ask"]), 1), max_count)
+
                     order = self.kalshi.place_order(
                         ticker=ticker,
                         yes_price=f"{odds['yes_ask']:.4f}",
-                        count=max(int(kelly.bet_usd / odds["yes_ask"]), 1),
+                        count=contract_count,
                         side="bid",
                     )
                     if order:
@@ -535,7 +539,7 @@ class PaperTrader:
                         market.last_trade_side = "yes"
                         market.last_trade_price = odds["yes_ask"]
                     else:
-                        trade_record["status"] = "failed"
+                        trade_record["status"] = "failed (check balance)"
                 except Exception as e:
                     trade_record["status"] = f"error: {e}"
             else:
