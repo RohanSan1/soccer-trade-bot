@@ -385,10 +385,24 @@ class PaperTrader:
         """Scan Kalshi for open soccer events."""
         logger.debug("Scanning Kalshi for soccer events...")
 
-        events = self.kalshi.get_game_events("soccer")
+        # Only scan WC Final-related series to avoid rate limits
+        wc_series = ["KXWCGAME", "KXMENWORLDCUP"]
+        events = []
+        for series in wc_series:
+            try:
+                resp = self.kalshi._request(
+                    "GET", "/events",
+                    params={"series_ticker": series, "limit": 50, "status": "open"},
+                )
+                if resp and "events" in resp:
+                    events.extend(resp["events"])
+            except Exception:
+                pass
+
         for event in events:
             event_ticker = event.get("event_ticker", "")
-            if "KXWCGAME" not in event_ticker and "KXMENWORLDCUP" not in event_ticker:
+            # Only track WC Final and tournament futures
+            if "KXWCGAME-26JUL19ESPARG" not in event_ticker and "KXMENWORLDCUP-26" not in event_ticker:
                 continue
 
             markets = self.kalshi.get_event_markets(event_ticker)
