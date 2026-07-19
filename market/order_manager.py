@@ -114,13 +114,14 @@ class OrderManager:
                     size=contracts,
                 )
             elif platform == "kalshi" and self.kalshi:
-                # Kalshi: price in cents, count = number of contracts
-                cents = int(price * 100)
-                count = int(size_usd)  # 1 contract = $1 at resolution
+                # Kalshi: yes_price as 4-decimal dollar string (e.g., "0.5600")
+                # count = number of contracts (1 contract = $1 at resolution)
+                yes_price_str = f"{price:.4f}"
+                count = max(1, int(size_usd))  # At least 1 contract
                 order_id = self.kalshi.place_order(
                     ticker=market_id,
                     side=side.upper(),
-                    yes_price=cents,
+                    yes_price=yes_price_str,
                     count=count,
                 )
             else:
