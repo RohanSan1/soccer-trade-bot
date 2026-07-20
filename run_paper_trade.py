@@ -715,17 +715,71 @@ class PaperTrader:
                     "no_ask": book.no_ask,
                 }
 
+    def _adjust_for_regulation(self, probs: tuple) -> tuple:
+        """Adjust model probabilities for regulation-time-only markets.
+
+        The model predicts full-match outcomes (including extra time/penalties).
+        Kalshi KXWCGAME markets settle after 90 minutes only.
+
+        In regulation time:
+        - Draw rate is ~30% higher (some draws become wins in extra time)
+        - Win rate is ~10% lower (some wins happen only in extra time)
+
+        This is a known bias in regulation-time vs full-match markets.
+
+        Args:
+            probs: (home_prob, draw_prob, away_prob) from full-match model.
+
+        Returns:
+            Adjusted (home, draw, away) probabilities for regulation time.
+        """
+        home, draw, away = probs
+
+        # Boost draw probability by 30%
+        draw_boost = draw * 0.30
+
+        # Reduce win probabilities proportionally (split the boost evenly)
+        win_reduction = draw_boost / 2
+
+        adj_home = max(home - win_reduction, 0.01)
+        adj_away = max(away - win_reduction, 0.01)
+        adj_draw = draw + draw_boost
+
+        # Normalize to sum to 1.0
+        total = adj_home + adj_draw + adj_away
+        if total > 0:
+            adj_home /= total
+            adj_draw /= total
+            adj_away /= total
+
+        logger.info(
+            "REG ADJ: home %.1f%%->%.1f%% | draw %.1f%%->%.1f%% | away %.1f%%->%.1f%%",
+            home * 100, adj_home * 100,
+            draw * 100, adj_draw * 100,
+            away * 100, adj_away * 100,
+        )
+
+        return (adj_home, adj_draw, adj_away)
+
     def _check_edges(self) -> None:
         """Check for trading edges and place paper trades.
 
         Checks ALL active markets on every call (no trades_count skip).
         Per-ticker cooldown prevents rapid-fire orders.
+
+        Applies regulation-time adjustment: Kalshi KXWCGAME markets are
+        regulation-time only (90 min). Model predicts full-match winners.
+        Regulation-time draws are ~30% more likely than full-match draws
+        because some tied matches get decided in extra time.
         """
         if not self.predictor or not self._game_state or not self._last_prediction:
             return
 
         pred = self._last_prediction
         probs = (pred["home"], pred["draw"], pred["away"])
+
+        # Apply regulation-time adjustment
+        probs = self._adjust_for_regulation(probs)
 
         # Skip if clock > final_minutes_skip
         if self._game_state.clock_minutes > (90 - self.config.final_minutes_skip):
