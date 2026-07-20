@@ -221,13 +221,13 @@ class PaperTrader:
                     self._poll_match_state()
                     last_api_poll = now
 
-                    # If match hasn't started yet, poll more frequently (every 10s)
+                    # Adjust poll interval based on match status
                     if not self._match_started and not self._match_ended:
-                        self._poll_interval = 10
+                        self._poll_interval = 300  # Pre-match: poll every 5 min (save API calls)
                     elif self._match_started and not self._match_ended:
                         self._poll_interval = 30  # Live: poll every 30s
                     else:
-                        self._poll_interval = 300  # Post-match: poll every 5min
+                        self._poll_interval = 600  # Post-match: poll every 10min
 
                     # Check for edge right after fresh data
                     if self.predictor and self._last_prediction and self._match_started:
@@ -474,7 +474,8 @@ class PaperTrader:
                     self._match_state = state
                     self._game_state = self._match_state_to_game_state(state)
 
-                    if self.predictor and self._game_state:
+                    # Only predict when match is live (skip NS — generic defaults produce garbage)
+                    if state.is_live and self.predictor and self._game_state:
                         try:
                             p_home, p_draw, p_away = self.predictor.predict(self._game_state)
                             self._last_prediction = {
@@ -701,7 +702,7 @@ class PaperTrader:
         events = []
         for i, series in enumerate(self._GAME_SERIES):
             if i > 0:
-                time.sleep(0.5)  # Rate limit: 0.5s between series
+                time.sleep(1.5)  # Rate limit: 1.5s between series
             try:
                 resp = self.kalshi._request(
                     "GET", "/events",
