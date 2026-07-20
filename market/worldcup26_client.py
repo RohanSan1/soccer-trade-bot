@@ -41,7 +41,7 @@ class WorldCup26Client:
         self._last_request_time = 0.0
 
     def get_all_matches(self) -> list:
-        """Fetch all matches. Returns list of match dicts."""
+        """Fetch all matches. Returns list of match dicts (unwrapped)."""
         elapsed = time.time() - self._last_request_time
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
@@ -51,7 +51,13 @@ class WorldCup26Client:
             self._last_request_time = time.time()
             self._request_count += 1
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                # API wraps in {"games": [...]} — unwrap
+                if isinstance(data, dict) and "games" in data:
+                    return data["games"]
+                if isinstance(data, list):
+                    return data
+                return []
             logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
         except requests.RequestException as e:
             logger.warning("worldcup26.ir request failed: %s", e)
@@ -61,6 +67,8 @@ class WorldCup26Client:
         """Fetch a single match by MongoDB ID.
 
         WC Final MongoDB ID: 679c9c8a5749c4077500e092
+
+        Returns the inner game dict (unwrapped from {"game": {...}}).
         """
         elapsed = time.time() - self._last_request_time
         if elapsed < 1.0:
@@ -71,7 +79,11 @@ class WorldCup26Client:
             self._last_request_time = time.time()
             self._request_count += 1
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                # API wraps in {"game": {...}} — unwrap
+                if isinstance(data, dict) and "game" in data:
+                    return data["game"]
+                return data
             logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
         except requests.RequestException as e:
             logger.warning("worldcup26.ir request failed: %s", e)
