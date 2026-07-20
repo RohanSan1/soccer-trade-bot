@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-import requests
+import cloudscraper
 
 logger = logging.getLogger(__name__)
 
@@ -86,13 +86,8 @@ class KickoffApiClient:
         self._current_key_idx = 0
         self._request_count = 0
         self._last_request_time = 0.0
-        self._session = requests.Session()
+        self._session = cloudscraper.create_scraper()
         self._remaining_per_key: Dict[str, int] = {k: 100 for k in keys}
-        self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
 
     @property
     def _api_key(self) -> str:
@@ -156,7 +151,7 @@ class KickoffApiClient:
                     else:
                         logger.error("KickoffAPI %d: %s", resp.status_code, resp.text[:200])
                         return None
-                except requests.RequestException as e:
+                except Exception as e:
                     logger.error("KickoffAPI request failed: %s", e)
                     return None
 
@@ -167,7 +162,7 @@ class KickoffApiClient:
         """Fetch live match state by fixture ID.
 
         Args:
-            fixture_id: The fixture ID (e.g., 1591866 for Spain vs Argentina).
+            fixture_id: The fixture ID (e.g., 1494214 for Kalmar vs Malmo).
 
         Returns:
             LiveMatchState with all available data, or None if error.
@@ -177,7 +172,58 @@ class KickoffApiClient:
             return None
 
         fixture = data["response"][0]
-        return self._parse_fixture(fixture)
+        state = self._parse_fixture(fixture)
+
+        # Fetch events for live matches (1 extra request)
+        if state.is_live and fixture_id:
+            state.events = self.get_live_events(fixture_id)
+            for event in state.events:
+                is_home = event.team_id == fixture.get("homeTeamId", 0)
+                if event.event_type == "Card":
+                    if event.detail == "Red Card":
+                        if is_home:
+                            state.home_red_cards += 1
+                        else:
+                            state.away_red_cards += 1
+                    elif event.detail == "Yellow Card":
+                        if is_home:
+                            state.home_yellow_cards += 1
+                        else:
+                            state.away_yellow_cards += 1
+
+        return state
+
+    def get_fixtures_by_date(self, date: str) -> List[Dict]:
+        """Fetch all fixtures for a given date.
+
+        Args:
+            date: Date string in YYYY-MM-DD format.
+
+        Returns:
+            List of fixture dicts from the API response.
+        """
+        data = self._get("fixtures", {"date": date})
+        if not data or "response" not in data:
+            return []
+        return data["response"]
+
+    def get_live_fixtures_for_date(self, date: str, league_id: Optional[int] = None) -> List[LiveMatchState]:
+        """Fetch all fixtures for a date and return as LiveMatchState list.
+
+        Args:
+            date: Date string YYYY-MM-DD.
+            league_id: Optional filter by league ID (e.g., 113 for Allsvenskan).
+
+        Returns:
+            List of LiveMatchState objects.
+        """
+        fixtures = self.get_fixtures_by_date(date)
+        results = []
+        for f in fixtures:
+            if league_id is not None and f.get("leagueId") != league_id:
+                continue
+            results.append(self._parse_fixture(f))
+        return results
 
     def get_live_events(self, fixture_id: int) -> List[KickoffEvent]:
         """Fetch match events (goals, cards, subs)."""
@@ -262,38 +308,6 @@ class KickoffApiClient:
             is_live=is_live,
             period=period,
         )
-
-        # Fetch events and stats for live matches (only costs 2 extra requests)
-        if is_live and fixture_id:
-            state.events = self.get_live_events(fixture_id)
-
-            # Count cards from events
-            for event in state.events:
-                is_home = event.team_id == fixture.get("homeTeamId", 0)
-                if event.event_type == "Card":
-                    if event.detail == "Red Card":
-                        if is_home:
-                            state.home_red_cards += 1
-                        else:
-                            state.away_red_cards += 1
-                    elif event.detail == "Yellow Card":
-                        if is_home:
-                            state.home_yellow_cards += 1
-                        else:
-                            state.away_yellow_cards += 1
-
-            # Fetch stats (1 extra request)
-            home_stats, away_stats = self.get_match_statistics(fixture_id)
-            state.home_stats = home_stats
-            state.away_stats = away_stats
-
-            if home_stats and away_stats and home_stats.possession > 0:
-                state.home_pressure = home_stats.possession / 100.0
-
-            # Estimate running xG from shots (rough approximation)
-            if home_stats and away_stats:
-                state.home_xg_running = home_stats.shots_on * 0.10 + home_stats.shots_off * 0.05
-                state.away_xg_running = away_stats.shots_on * 0.10 + away_stats.shots_off * 0.05
 
         return state
 

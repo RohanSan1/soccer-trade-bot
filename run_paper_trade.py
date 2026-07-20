@@ -115,6 +115,9 @@ class PaperTrader:
             "KXCHAMPIONSLEAGUEGAME",
         ]
 
+        # Active fixtures from KickoffAPI (non-FIFA matches)
+        self._active_fixtures: Dict[int, Dict] = {}
+
         # Match timing
         self._match_kickoff: Optional[datetime] = None
         self._match_started = False
@@ -255,59 +258,79 @@ class PaperTrader:
         self._shutdown()
 
     def _detect_match_schedule(self) -> None:
-        """Detect match schedule from worldcup26.ir data (FIFA matches only).
+        """Detect match schedule from worldcup26.ir or KickoffAPI.
 
-        For non-FIFA matches (Allsvenskan, Brasileiro, etc.), we rely
-        on Kalshi market status to determine when matches are live.
+        For FIFA matches: uses worldcup26.ir (primary).
+        For Allsvenskan/other leagues: uses KickoffAPI fixtures API.
         """
-        if not self.worldcup26:
-            return
+        # Try worldcup26 first (FIFA matches)
+        if self.worldcup26:
+            try:
+                matches = self.worldcup26.get_all_matches()
+                if matches:
+                    now = datetime.now(timezone.utc)
+                    for m in matches[:10]:
+                        match_data = self.worldcup26.get_match(m)
+                        if not match_data:
+                            continue
 
-        try:
-            matches = self.worldcup26.get_all_matches()
-            if not matches:
-                return
+                        status = self.worldcup26.get_match_status(match_data)
+                        if status in ("live", "LIVE", "HALFTIME", "SECOND_HALF"):
+                            self._match_kickoff = self.worldcup26.parse_local_date(match_data)
+                            self._wc_match_id = m.get("_id")
+                            logger.info("Found live FIFA match: %s (ID: %s)", m.get("home_team_name_en"), self._wc_match_id)
+                            return
 
-            # Find live or upcoming matches
-            for m in matches:
-                match_data = self.worldcup26.get_match(m)
-                if not match_data:
-                    continue
+                        kickoff = self.worldcup26.parse_local_date(match_data)
+                        if kickoff and kickoff > now and (kickoff - now).total_seconds() / 60 < 120:
+                            self._match_kickoff = kickoff
+                            self._wc_match_id = m.get("_id")
+                            logger.info("Upcoming FIFA match: %s at %s", m.get("home_team_name_en"), kickoff.strftime("%H:%M UTC"))
+                            return
+            except Exception as e:
+                logger.debug("worldcup26 schedule detection failed: %s", e)
 
-                status = self.worldcup26.get_match_status(match_data)
-                if status in ("live", "LIVE", "HALFTIME", "SECOND_HALF"):
-                    self._match_kickoff = self.worldcup26.parse_local_date(match_data)
-                    self._wc_match_id = m.get("_id")
-                    logger.info("Found live FIFA match: %s (ID: %s)", m.get("home_team_name_en"), self._wc_match_id)
-                    return
+        # Try KickoffAPI for non-FIFA matches (Allsvenskan, Brasileiro, etc.)
+        if self.kickoff:
+            try:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                fixtures = self.kickoff.get_fixtures_by_date(today)
+                for f in fixtures:
+                    league_id = f.get("leagueId")
+                    status = f.get("statusShort", "NS")
+                    home = f.get("homeTeam", {}).get("name", "")
+                    away = f.get("awayTeam", {}).get("name", "")
+                    fixture_id = f.get("id", 0)
 
-            # No live match found — check for upcoming
-            now = datetime.now(timezone.utc)
-            for m in matches:
-                match_data = self.worldcup26.get_match(m)
-                if not match_data:
-                    continue
+                    # Track live or upcoming Allsvenskan matches (league 113)
+                    if league_id == 113 and status != "FT":
+                        if status in ("1H", "2H", "HT", "ET", "PEN"):
+                            if not self._match_started:
+                                self._match_started = True
+                                logger.info("KICKOFF LIVE: %s vs %s (ID: %s, %s)", home, away, fixture_id, status)
+                            self._active_fixtures[fixture_id] = f
+                        else:
+                            logger.info("KICKOFF UPCOMING: %s vs %s (ID: %s, %s)", home, away, fixture_id, status)
+                            self._active_fixtures[fixture_id] = f
 
-                kickoff = self.worldcup26.parse_local_date(match_data)
-                if kickoff and kickoff > now and (kickoff - now).total_seconds() / 60 < 120:
-                    self._match_kickoff = kickoff
-                    self._wc_match_id = m.get("_id")
-                    logger.info("Upcoming FIFA match: %s at %s", m.get("home_team_name_en"), kickoff.strftime("%H:%M UTC"))
-                    return
-
-        except Exception as e:
-            logger.debug("Schedule detection failed: %s", e)
+                if self._active_fixtures:
+                    logger.info("Found %d Allsvenskan fixtures to track", len(self._active_fixtures))
+            except Exception as e:
+                logger.debug("KickoffAPI fixture discovery failed: %s", e)
 
     def _discover_markets(self) -> None:
         """Discover all open soccer match markets on Kalshi.
 
         Scans multiple league series for active match markets.
         Each event has 3 markets: home winner, away winner, tie.
+        Includes rate limiting to avoid 429 errors.
         """
         logger.info("Discovering soccer match markets...")
 
         found = 0
-        for series in self._GAME_SERIES:
+        for i, series in enumerate(self._GAME_SERIES):
+            if i > 0:
+                time.sleep(2)  # Rate limit: 2s between series
             try:
                 resp = self.kalshi._request(
                     "GET", "/events",
@@ -359,14 +382,12 @@ class PaperTrader:
         """Poll for live match state.
 
         Primary: worldcup26.ir (FIFA matches only, unlimited).
-        Fallback: KickoffAPI (backup, may be Cloudflare-blocked).
+        Fallback: KickoffAPI (Allsvenskan, Brasileiro, etc. — cloudscraper bypasses Cloudflare).
 
-        For non-FIFA matches, returns None (market-only mode).
+        For non-FIFA matches, discovers fixtures from KickoffAPI and polls them.
         """
-        fixture_id = int(os.environ.get("KICKOFF_FIXTURE_ID", "1591866"))
+        # Try worldcup26 first (FIFA matches only)
         now = datetime.now(timezone.utc)
-
-        # Try worldcup26.ir first (FIFA matches only)
         if self.worldcup26 and self._wc_match_id:
             try:
                 match_data = self.worldcup26.get_match(self._wc_match_id)
@@ -393,52 +414,73 @@ class PaperTrader:
                         if not self._match_ended:
                             self._match_ended = True
                             logger.info("MATCH ENDED (worldcup26 reports finished)")
-                        self._parse_worldcup26_data(match_data, fixture_id)
+                        self._parse_worldcup26_data(match_data, 0)
                         return
                     elif wc_status == "live" or (":" in str(match_data.get("time_elapsed", ""))):
                         if not self._match_started:
                             self._match_started = True
                             logger.info("MATCH IS LIVE")
-                        self._parse_worldcup26_data(match_data, fixture_id)
+                        self._parse_worldcup26_data(match_data, 0)
                         return
                     else:
                         # Not started yet, not stale — just waiting
-                        self._parse_worldcup26_data(match_data, fixture_id)
+                        self._parse_worldcup26_data(match_data, 0)
                         return
 
             except Exception as e:
                 logger.warning("worldcup26.ir failed: %s", e)
 
-        # Fallback: try KickoffAPI directly
+        # Fallback: try KickoffAPI for non-FIFA matches (Allsvenskan, etc.)
         if self.kickoff:
             try:
-                self._prev_match_state = self._match_state
-                self._match_state = self.kickoff.get_live_match(fixture_id)
-                if self._match_state:
-                    ms = self._match_state
-                    if ms.status in ("1H", "2H", "HT", "ET", "PEN", "LIVE"):
+                # Discover fixtures if we haven't yet
+                if not self._active_fixtures:
+                    self._detect_match_schedule()
+
+                # Poll each active fixture
+                for fixture_id, fixture_data in list(self._active_fixtures.items()):
+                    state = self.kickoff.get_live_match(fixture_id)
+                    if not state:
+                        continue
+
+                    # Update fixture data with latest state
+                    self._active_fixtures[fixture_id] = {
+                        **fixture_data,
+                        "statusShort": state.status,
+                        "goalsHome": state.home_score,
+                        "goalsAway": state.away_score,
+                        "elapsed": state.clock_minutes,
+                    }
+
+                    if state.status in ("1H", "2H", "HT", "ET", "PEN", "LIVE"):
                         if not self._match_started:
                             self._match_started = True
-                            logger.info("MATCH IS LIVE (via KickoffAPI)")
-                    elif ms.status == "FT":
+                            logger.info("MATCH IS LIVE: %s vs %s (via KickoffAPI)",
+                                       state.home_team, state.away_team)
+                    elif state.status == "FT":
                         if not self._match_ended:
                             self._match_ended = True
-                            logger.info("MATCH ENDED (via KickoffAPI)")
+                            logger.info("MATCH ENDED: %s vs %s (via KickoffAPI)",
+                                       state.home_team, state.away_team)
 
                     logger.info(
                         "LIVE: %s %d - %d %s | %s %s' | events=%d | API calls=%d",
-                        ms.home_team, ms.home_score, ms.away_score, ms.away_team,
-                        ms.status, ms.clock_minutes,
-                        len(ms.events), self.kickoff.request_count,
+                        state.home_team, state.home_score, state.away_score, state.away_team,
+                        state.status, state.clock_minutes,
+                        len(state.events), self.kickoff.request_count,
                     )
-                    self._game_state = self._match_state_to_game_state(ms)
+
+                    self._prev_match_state = self._match_state
+                    self._match_state = state
+                    self._game_state = self._match_state_to_game_state(state)
+
                     if self.predictor and self._game_state:
                         try:
                             p_home, p_draw, p_away = self.predictor.predict(self._game_state)
                             self._last_prediction = {
                                 "home": p_home, "draw": p_draw, "away": p_away,
                                 "confidence": max(p_home, p_draw, p_away),
-                                "clock": ms.clock_minutes,
+                                "clock": state.clock_minutes,
                             }
                             logger.info(
                                 "PREDICTION: home=%.1f%% draw=%.1f%% away=%.1f%% (conf=%.1f%%)",
@@ -449,6 +491,8 @@ class PaperTrader:
                             logger.warning("Prediction failed: %s", e)
                             self._last_prediction = None
                     self._write_state()
+                    break  # Process one fixture at a time
+
             except Exception as e:
                 logger.warning("KickoffAPI fallback failed: %s", e)
 
@@ -650,11 +694,14 @@ class PaperTrader:
         """Scan Kalshi for soccer events and markets.
 
         Fetches ALL market statuses across multiple league series.
+        Includes rate limiting to avoid 429 errors.
         """
         logger.debug("Scanning Kalshi for soccer events...")
 
         events = []
-        for series in self._GAME_SERIES:
+        for i, series in enumerate(self._GAME_SERIES):
+            if i > 0:
+                time.sleep(0.5)  # Rate limit: 0.5s between series
             try:
                 resp = self.kalshi._request(
                     "GET", "/events",
