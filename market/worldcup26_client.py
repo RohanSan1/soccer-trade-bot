@@ -39,9 +39,13 @@ class WorldCup26Client:
         })
         self._request_count = 0
         self._last_request_time = 0.0
+        self._consecutive_failures = 0
+        self._disabled = False  # Circuit breaker: disable after 3 consecutive failures
 
     def get_all_matches(self) -> list:
         """Fetch all matches. Returns list of match dicts (unwrapped)."""
+        if self._disabled:
+            return []
         elapsed = time.time() - self._last_request_time
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
@@ -51,6 +55,7 @@ class WorldCup26Client:
             self._last_request_time = time.time()
             self._request_count += 1
             if resp.status_code == 200:
+                self._consecutive_failures = 0
                 data = resp.json()
                 # API wraps in {"games": [...]} — unwrap
                 if isinstance(data, dict) and "games" in data:
@@ -58,9 +63,19 @@ class WorldCup26Client:
                 if isinstance(data, list):
                     return data
                 return []
-            logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self._disabled = True
+                logger.warning("worldcup26.ir disabled after %d consecutive failures (API likely down)", self._consecutive_failures)
+            else:
+                logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
         except requests.RequestException as e:
-            logger.warning("worldcup26.ir request failed: %s", e)
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self._disabled = True
+                logger.warning("worldcup26.ir disabled after %d consecutive failures: %s", self._consecutive_failures, e)
+            else:
+                logger.warning("worldcup26.ir request failed: %s", e)
         return []
 
     def get_match(self, mongodb_id: str) -> Optional[Dict]:
@@ -70,6 +85,8 @@ class WorldCup26Client:
 
         Returns the inner game dict (unwrapped from {"game": {...}}).
         """
+        if self._disabled:
+            return None
         elapsed = time.time() - self._last_request_time
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
@@ -79,14 +96,25 @@ class WorldCup26Client:
             self._last_request_time = time.time()
             self._request_count += 1
             if resp.status_code == 200:
+                self._consecutive_failures = 0
                 data = resp.json()
                 # API wraps in {"game": {...}} — unwrap
                 if isinstance(data, dict) and "game" in data:
                     return data["game"]
                 return data
-            logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self._disabled = True
+                logger.warning("worldcup26.ir disabled after %d consecutive failures", self._consecutive_failures)
+            else:
+                logger.warning("worldcup26.ir %d: %s", resp.status_code, resp.text[:200])
         except requests.RequestException as e:
-            logger.warning("worldcup26.ir request failed: %s", e)
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self._disabled = True
+                logger.warning("worldcup26.ir disabled after %d consecutive failures", self._consecutive_failures)
+            else:
+                logger.warning("worldcup26.ir request failed: %s", e)
         return None
 
     def find_fixture(self, home_team: str = "Spain", away_team: str = "Argentina") -> Optional[Dict]:

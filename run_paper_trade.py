@@ -302,19 +302,20 @@ class PaperTrader:
                     away = f.get("awayTeam", {}).get("name", "")
                     fixture_id = f.get("id", 0)
 
-                    # Track live or upcoming Allsvenskan matches (league 113)
-                    if league_id == 113 and status != "FT":
+                    # Track live or upcoming matches for leagues we trade
+                    TRACKED_LEAGUES = {113, 71, 72}  # Allsvenskan, Brasileiro A, Brasileiro B
+                    if league_id in TRACKED_LEAGUES and status != "FT":
                         if status in ("1H", "2H", "HT", "ET", "PEN"):
                             if not self._match_started:
                                 self._match_started = True
-                                logger.info("KICKOFF LIVE: %s vs %s (ID: %s, %s)", home, away, fixture_id, status)
+                                logger.info("KICKOFF LIVE: %s vs %s (ID: %s, league %s, %s)", home, away, fixture_id, league_id, status)
                             self._active_fixtures[fixture_id] = f
                         else:
-                            logger.info("KICKOFF UPCOMING: %s vs %s (ID: %s, %s)", home, away, fixture_id, status)
+                            logger.info("KICKOFF UPCOMING: %s vs %s (ID: %s, league %s, %s)", home, away, fixture_id, league_id, status)
                             self._active_fixtures[fixture_id] = f
 
                 if self._active_fixtures:
-                    logger.info("Found %d Allsvenskan fixtures to track", len(self._active_fixtures))
+                    logger.info("Found %d fixtures to track", len(self._active_fixtures))
             except Exception as e:
                 logger.debug("KickoffAPI fixture discovery failed: %s", e)
 
