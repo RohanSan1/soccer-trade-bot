@@ -258,13 +258,16 @@ class PaperTrader:
         self._shutdown()
 
     def _detect_match_schedule(self) -> None:
-        """Detect match schedule from worldcup26.ir or KickoffAPI.
+        """Detect match schedule and pick the BEST single match to track.
 
-        For FIFA matches: uses worldcup26.ir (primary).
-        For Allsvenskan/other leagues: uses KickoffAPI fixtures API.
+        Scores each candidate on:
+        1. Market liquidity (tight spreads, volume from Kalshi)
+        2. Data quality (league tier, time until kickoff for more pre-match info)
+
+        Only tracks 1 match to stay within KickoffAPI daily limits.
         """
         # Try worldcup26 first (FIFA matches)
-        if self.worldcup26:
+        if self.worldcup26 and not self.worldcup26._disabled:
             try:
                 matches = self.worldcup26.get_all_matches()
                 if matches:
@@ -273,14 +276,12 @@ class PaperTrader:
                         match_data = self.worldcup26.get_match(m)
                         if not match_data:
                             continue
-
                         status = self.worldcup26.get_match_status(match_data)
                         if status in ("live", "LIVE", "HALFTIME", "SECOND_HALF"):
                             self._match_kickoff = self.worldcup26.parse_local_date(match_data)
                             self._wc_match_id = m.get("_id")
                             logger.info("Found live FIFA match: %s (ID: %s)", m.get("home_team_name_en"), self._wc_match_id)
                             return
-
                         kickoff = self.worldcup26.parse_local_date(match_data)
                         if kickoff and kickoff > now and (kickoff - now).total_seconds() / 60 < 120:
                             self._match_kickoff = kickoff
@@ -290,34 +291,136 @@ class PaperTrader:
             except Exception as e:
                 logger.debug("worldcup26 schedule detection failed: %s", e)
 
-        # Try KickoffAPI for non-FIFA matches (Allsvenskan, Brasileiro, etc.)
+        # Try KickoffAPI — collect candidates, score, pick best
         if self.kickoff:
             try:
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 fixtures = self.kickoff.get_fixtures_by_date(today)
+                now = datetime.now(timezone.utc)
+
+                TRACKED_LEAGUES = {113: 1.0, 71: 1.0, 72: 0.8}  # Allsvenskan, Serie A, Serie B (weight)
+                candidates = []
+
                 for f in fixtures:
                     league_id = f.get("leagueId")
                     status = f.get("statusShort", "NS")
                     home = f.get("homeTeam", {}).get("name", "")
                     away = f.get("awayTeam", {}).get("name", "")
                     fixture_id = f.get("id", 0)
+                    date_str = f.get("date", "")
 
-                    # Track live or upcoming matches for leagues we trade
-                    TRACKED_LEAGUES = {113, 71, 72}  # Allsvenskan, Brasileiro A, Brasileiro B
-                    if league_id in TRACKED_LEAGUES and status != "FT":
-                        if status in ("1H", "2H", "HT", "ET", "PEN"):
-                            if not self._match_started:
-                                self._match_started = True
-                                logger.info("KICKOFF LIVE: %s vs %s (ID: %s, league %s, %s)", home, away, fixture_id, league_id, status)
-                            self._active_fixtures[fixture_id] = f
-                        else:
-                            logger.info("KICKOFF UPCOMING: %s vs %s (ID: %s, league %s, %s)", home, away, fixture_id, league_id, status)
-                            self._active_fixtures[fixture_id] = f
+                    if league_id not in TRACKED_LEAGUES or status == "FT":
+                        continue
 
-                if self._active_fixtures:
-                    logger.info("Found %d fixtures to track", len(self._active_fixtures))
+                    # Parse kickoff time for scoring
+                    try:
+                        kickoff = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                        minutes_until = (kickoff - now).total_seconds() / 60
+                    except Exception:
+                        minutes_until = 999
+
+                    # Find matching Kalshi market for this fixture
+                    kalshi_score = self._score_kalshi_match(home, away)
+
+                    # Combined score: market liquidity (0-1) × 0.6 + league weight × 0.2 + time bonus × 0.2
+                    # Time bonus: higher if match starts within 2 hours (more relevant)
+                    time_bonus = min(1.0, max(0.0, 1.0 - minutes_until / 300)) if minutes_until > 0 else 0.5
+                    league_weight = TRACKED_LEAGUES[league_id]
+                    combined = kalshi_score * 0.6 + league_weight * 0.2 + time_bonus * 0.2
+
+                    candidates.append({
+                        "fixture_id": fixture_id,
+                        "home": home,
+                        "away": away,
+                        "league_id": league_id,
+                        "status": status,
+                        "minutes_until": minutes_until,
+                        "kalshi_score": kalshi_score,
+                        "combined": combined,
+                    })
+
+                    if status in ("1H", "2H", "HT", "ET", "PEN"):
+                        # Live match — auto-select, no scoring needed
+                        if not self._match_started:
+                            self._match_started = True
+                            logger.info("KICKOFF LIVE: %s vs %s (ID: %s, league %s, %s)", home, away, fixture_id, league_id, status)
+                        self._active_fixtures[fixture_id] = f
+                        return  # Live match takes priority
+
+                # Pick best upcoming match
+                if candidates:
+                    candidates.sort(key=lambda x: x["combined"], reverse=True)
+                    best = candidates[0]
+                    self._active_fixtures[best["fixture_id"]] = next(
+                        f for f in fixtures if f.get("id") == best["fixture_id"]
+                    )
+                    logger.info(
+                        "BEST MATCH: %s vs %s (ID: %s, league %s, score=%.2f, kalshi=%.2f, time=%.1fh)",
+                        best["home"], best["away"], best["fixture_id"], best["league_id"],
+                        best["combined"], best["kalshi_score"], best["minutes_until"] / 60,
+                    )
+                    # Log rejected candidates for transparency
+                    for c in candidates[1:3]:
+                        logger.info(
+                            "  Rejected: %s vs %s (score=%.2f, kalshi=%.2f)",
+                            c["home"], c["away"], c["combined"], c["kalshi_score"],
+                        )
+
             except Exception as e:
                 logger.debug("KickoffAPI fixture discovery failed: %s", e)
+
+    def _score_kalshi_match(self, home: str, away: str) -> float:
+        """Score a match based on Kalshi market liquidity.
+
+        Returns 0.0-1.0 based on:
+        - Spread tightness (lower spread = higher score)
+        - Whether markets exist for this match
+
+        Higher = more liquid = better for trading.
+        """
+        best_score = 0.0
+        home_lower = home.lower().replace(" fc", "").replace(" cf", "").replace(" sc", "").strip()
+        away_lower = away.lower().replace(" fc", "").replace(" cf", "").replace(" sc", "").strip()
+
+        for ticker, market in self._active_markets.items():
+            title = market.title.lower()
+            if " vs " not in title:
+                continue
+            teams = title.split(" vs ")
+            team_a = teams[0].strip().lower()
+            team_b = teams[1].strip().split(" winner")[0].strip().lower()
+
+            # Check if this market matches our fixture
+            a_match = any(word in team_a for word in home_lower.split() if len(word) > 3)
+            b_match = any(word in team_b for word in away_lower.split() if len(word) > 3)
+            a_match_rev = any(word in team_a for word in away_lower.split() if len(word) > 3)
+            b_match_rev = any(word in team_b for word in home_lower.split() if len(word) > 3)
+
+            if (a_match and b_match) or (a_match_rev and b_match_rev):
+                odds = market.last_odds
+                if not odds or odds.get("yes_ask", 0) <= 0:
+                    continue
+
+                # Score based on spread tightness
+                spread = odds["yes_ask"] - odds["yes_bid"]
+                if spread <= 0.04:
+                    score = 1.0  # Very tight spread
+                elif spread <= 0.08:
+                    score = 0.8
+                elif spread <= 0.15:
+                    score = 0.5
+                else:
+                    score = 0.2
+
+                # Bonus for volume
+                if market.volume > 50:
+                    score = min(1.0, score + 0.2)
+                elif market.volume > 10:
+                    score = min(1.0, score + 0.1)
+
+                best_score = max(best_score, score)
+
+        return best_score
 
     def _discover_markets(self) -> None:
         """Discover all open soccer match markets on Kalshi.
