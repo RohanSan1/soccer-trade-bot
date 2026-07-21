@@ -225,7 +225,7 @@ class PaperTrader:
                     if not self._match_started and not self._match_ended:
                         self._poll_interval = 300  # Pre-match: poll every 5 min (save API calls)
                     elif self._match_started and not self._match_ended:
-                        self._poll_interval = 30  # Live: poll every 30s
+                        self._poll_interval = 60  # Live: poll every 60s (stay within 200/day API budget)
                     else:
                         self._poll_interval = 600  # Post-match: poll every 10min
 
