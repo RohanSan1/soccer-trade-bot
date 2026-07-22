@@ -284,6 +284,10 @@ def find_best_match(fixtures: List[Dict], kalshi_events: List[Dict]) -> Optional
     now = datetime.now(timezone.utc)
     candidates = []
 
+    # Track which Kalshi events we've already matched to fixtures
+    matched_kalshi = set()
+
+    # First, try to match KickoffAPI fixtures to Kalshi events
     for f in fixtures:
         league_id = f.get("leagueId")
         status = f.get("statusShort", "NS")
@@ -321,7 +325,7 @@ def find_best_match(fixtures: List[Dict], kalshi_events: List[Dict]) -> Optional
 
         # Score Kalshi market liquidity
         kalshi_score = 0.0
-        for event in kalshi_events:
+        for i, event in enumerate(kalshi_events):
             title = event.get("title", "").lower()
             if " vs " in title:
                 teams = title.split(" vs ")
@@ -331,6 +335,7 @@ def find_best_match(fixtures: List[Dict], kalshi_events: List[Dict]) -> Optional
                 a_words = [w for w in away.lower().split() if len(w) > 3]
                 if any(w in t_a for w in h_words) and any(w in t_b for w in a_words):
                     kalshi_score = 0.8
+                    matched_kalshi.add(i)
                     break
 
         time_bonus = min(1.0, max(0.0, 1.0 - minutes_until / 300)) if minutes_until > 0 else 0.5
@@ -348,6 +353,59 @@ def find_best_match(fixtures: List[Dict], kalshi_events: List[Dict]) -> Optional
             "kalshi_score": kalshi_score,
             "combined": combined,
         })
+
+    # If no fixtures from KickoffAPI, create candidates from Kalshi events
+    if not fixtures:
+        for i, event in enumerate(kalshi_events):
+            if i in matched_kalshi:
+                continue
+            title = event.get("title", "")
+            event_ticker = event.get("event_ticker", "")
+            if " vs " not in title:
+                continue
+            teams = title.split(" vs ")
+            home = teams[0].strip()
+            away = teams[1].strip().split(" winner")[0].strip()
+
+            # Check if this is a tracked league
+            series = event.get("series_ticker", "")
+            league_map = {
+                "KXALLSVENSKANGAME": 113,
+                "KXBRASILEIROGAME": 71,
+                "KXBRASILEIROBGAME": 72,
+            }
+            league_id = league_map.get(series, 0)
+            if league_id not in TRACKED_LEAGUES:
+                continue
+
+            # Parse kickoff from event ticker (format: KXALLSVENSKANGAME-26JUL20KALMAL-MAL)
+            try:
+                # Extract date from ticker: 26JUL20 → Jul 26, 2026
+                date_part = event_ticker.split("-")[1] if "-" in event_ticker else ""
+                if len(date_part) >= 6:
+                    day = int(date_part[:2])
+                    month_map = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                                "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+                    month = month_map.get(date_part[2:5].upper(), 0)
+                    year = 2000 + int(date_part[5:7]) if len(date_part) >= 7 else 2026
+                    if month > 0:
+                        kickoff = datetime(year, month, day, 20, 0, tzinfo=timezone.utc)  # Default to 8PM UTC
+                        minutes_until = (kickoff - now).total_seconds() / 60
+                        if minutes_until < -10 or minutes_until > 240:
+                            continue
+                        candidates.append({
+                            "fixture_id": hash(event_ticker) % 1000000,
+                            "home": home,
+                            "away": away,
+                            "kickoff_utc": kickoff.isoformat(),
+                            "league_id": league_id,
+                            "status": "NS",
+                            "minutes_until": minutes_until,
+                            "kalshi_score": 0.8,
+                            "combined": 0.8 * 0.6 + TRACKED_LEAGUES[league_id] * 0.2 + 0.5 * 0.2,
+                        })
+            except Exception:
+                pass
 
     if not candidates:
         return None
@@ -383,15 +441,16 @@ def cmd_check():
     state = load_state()
 
     # Fetch data
-    logger.info("Fetching KickoffAPI fixtures for %s...", today)
-    fixtures = fetch_kickoff_fixtures(today)
-    logger.info("Found %d fixtures", len(fixtures))
-
-    logger.info("Fetching Kalshi events...")
+    logger.info("Fetching Kalshi events for match discovery...")
     kalshi_events = fetch_kalshi_events()
     logger.info("Found %d Kalshi events", len(kalshi_events))
 
-    # Find best match
+    # Try KickoffAPI (may fail on Cloudflare-protected environments)
+    logger.info("Fetching KickoffAPI fixtures for %s...", today)
+    fixtures = fetch_kickoff_fixtures(today)
+    logger.info("Found %d KickoffAPI fixtures", len(fixtures))
+
+    # Find best match (prioritize Kalshi, fallback to KickoffAPI)
     best = find_best_match(fixtures, kalshi_events)
 
     if not best:
@@ -408,18 +467,42 @@ def cmd_check():
                 kickoff = datetime.fromisoformat(f.get("date", "").replace("Z", "+00:00"))
                 mins = (kickoff - now).total_seconds() / 60
                 if mins > 0:
-                    all_candidates.append((f, mins))
+                    all_candidates.append((f.get("homeTeam", {}).get("name", ""), f.get("awayTeam", {}).get("name", ""), mins))
             except Exception:
                 pass
 
+        # Also check Kalshi events for upcoming matches
+        for event in kalshi_events:
+            title = event.get("title", "")
+            series = event.get("series_ticker", "")
+            if " vs " in title and series in ("KXALLSVENSKANGAME", "KXBRASILEIROGAME", "KXBRASILEIROBGAME"):
+                teams = title.split(" vs ")
+                home = teams[0].strip()
+                away = teams[1].strip().split(" winner")[0].strip()
+                # Estimate kickoff from event ticker
+                event_ticker = event.get("event_ticker", "")
+                date_part = event_ticker.split("-")[1] if "-" in event_ticker else ""
+                if len(date_part) >= 6:
+                    try:
+                        day = int(date_part[:2])
+                        month_map = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                                    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+                        month = month_map.get(date_part[2:5].upper(), 0)
+                        year = 2000 + int(date_part[5:7]) if len(date_part) >= 7 else 2026
+                        if month > 0:
+                            kickoff = datetime(year, month, day, 20, 0, tzinfo=timezone.utc)
+                            mins = (kickoff - now).total_seconds() / 60
+                            if mins > 0:
+                                all_candidates.append((home, away, mins))
+                    except Exception:
+                        pass
+
         if all_candidates:
-            all_candidates.sort(key=lambda x: x[1])
-            f, mins = all_candidates[0]
-            home = f.get("homeTeam", {}).get("name", "")
-            away = f.get("awayTeam", {}).get("name", "")
+            all_candidates.sort(key=lambda x: x[2])
+            home, away, mins = all_candidates[0]
             logger.info(
-                "Next match: %s vs %s in %.1f hours (league %s) — studio will start when within 2hr",
-                home, away, mins / 60, f.get("leagueId"),
+                "Next match: %s vs %s in %.1f hours — studio will start when within 2hr",
+                home, away, mins / 60,
             )
 
         # If studio is running and no match, stop it
