@@ -41,12 +41,11 @@ jobs:
           LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
         run: |
           mkdir -p ~/.lightning
-          cat > ~/.lightning/config.json << EOF
-          {
-            "user_id": "$LIGHTNING_USER_ID",
-            "api_key": "$LIGHTNING_API_KEY"
-          }
-          EOF
+          printf '{"user_id":"%s","api_key":"%s","auth_token":""}\n' "$LIGHTNING_USER_ID" "$LIGHTNING_API_KEY" > ~/.lightning/credentials.json
+          printf 'studio:\n  name: soccer-trade-train\nteamspace:\n  name: deploy-model-project\n  owner: juy595711-org\n  owner_type: organization\n' > ~/.lightning/config.yaml
+          echo "Lightning config written"
+          cat ~/.lightning/credentials.json
+          cat ~/.lightning/config.yaml
 
       - name: Decode Kalshi private key
         env:
