@@ -48,16 +48,12 @@ jobs:
           }
           EOF
 
-      - name: Debug env vars
+      - name: Decode Kalshi private key
         env:
-          KICKOFF_API_KEY: ${{ secrets.KICKOFF_API_KEY }}
-          KICKOFF_API_KEY_2: ${{ secrets.KICKOFF_API_KEY_2 }}
-          KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
+          KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY_B64 }}
         run: |
-          echo "KICKOFF_API_KEY length: ${#KICKOFF_API_KEY}"
-          echo "KICKOFF_API_KEY_2 length: ${#KICKOFF_API_KEY_2}"
-          echo "KALSHI_API_KEY length: ${#KALSHI_API_KEY}"
-          echo "KALSHI_PRIVATE_KEY length: ${#KALSHI_PRIVATE_KEY}"
+          echo "$KALSHI_PRIVATE_KEY_B64" | base64 -d > /tmp/kalshi_key.pem
+          echo "KALSHI_PRIVATE_KEY decoded, length: $(wc -c < /tmp/kalshi_key.pem)"
 
       - name: Run auto-trade check
         env:
@@ -66,8 +62,9 @@ jobs:
           KICKOFF_API_KEY: ${{ secrets.KICKOFF_API_KEY }}
           KICKOFF_API_KEY_2: ${{ secrets.KICKOFF_API_KEY_2 }}
           KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
-          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          KALSHI_PRIVATE_KEY_FILE: /tmp/kalshi_key.pem
         run: |
+          export KALSHI_PRIVATE_KEY="$(cat /tmp/kalshi_key.pem)"
           ACTION="${{ github.event.inputs.action || 'check' }}"
           python scripts/auto_trade.py "$ACTION"
 
